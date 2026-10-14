@@ -32,6 +32,13 @@ class ChatMessage(BaseModel):
                     texts.append(part.get("text") or "")
                 elif isinstance(part, str):
                     texts.append(part)
+                elif isinstance(part, dict) and part.get("type") in ("image_url", "input_image", "image"):
+                    # images can't be forwarded; say so instead of silently dropping them
+                    # (otherwise the model guesses at an image it never saw)
+                    texts.append("\n[An image was attached here, but it could not be passed to you: "
+                                 "you cannot see it. If the request depends on it, say so.]\n")
+                elif isinstance(part, dict) and part.get("type") in ("input_text", "output_text"):
+                    texts.append(part.get("text") or "")
             return "".join(texts)
         return str(v)
 
@@ -55,6 +62,13 @@ class ChatCompletionRequest(BaseModel):
     reasoning_effort: Optional[str] = Field(default=None)
     reasoning: Optional[Dict[str, Any]] = Field(default=None)
     thinking: Optional[Dict[str, Any]] = Field(default=None)
+    user: Optional[str] = Field(default=None, description="End-user id (OpenAI `user`); scopes thread reuse.")
+    # Output controls (enforced after generation, see app/output_controls.py)
+    max_tokens: Optional[int] = Field(default=None)
+    max_completion_tokens: Optional[int] = Field(default=None)
+    stop: Optional[Any] = Field(default=None)
+    response_format: Optional[Dict[str, Any]] = Field(default=None)
+    n: Optional[int] = Field(default=None)
     requested_model: Optional[str] = Field(default=None, exclude=True)
 
     @model_validator(mode="after")

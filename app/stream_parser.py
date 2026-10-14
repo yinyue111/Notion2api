@@ -10,9 +10,9 @@ from app.logger import logger
 
 # 清理 Notion 内部语言/格式标记的正则集合
 # 1. 完整的 <lang ...>...</lang> 块，替换时只保留内部文本（_strip_lang_tags 的兜底）
-_RE_LANG_FULL = re.compile(r"<lang\b[^>]*>(.*?)</lang>", re.DOTALL)
+_RE_LANG_FULL = re.compile(r"<lang\s+primary\b[^>]*>(.*?)</lang>", re.DOTALL)
 # 2. 残留的 <lang ...> 孤立开标签（无对应内容或截断后留下的）
-_RE_LANG_OPEN = re.compile(r"<lang\b[^>]*>")
+_RE_LANG_OPEN = re.compile(r"<lang\s+primary\b[^>]*>")
 # 3. 残留的 </lang> 闭标签
 _RE_LANG_CLOSE = re.compile(r"</lang>")
 # 4. Notion 语言属性残片：如 primary="zh-CN" 或 primary="zh" 或 primary="en"
@@ -65,6 +65,21 @@ FINAL_STEP_PRIORITIES: dict[str, int] = {
 }
 
 
+def _is_notion_lang_open(rest: str) -> bool:
+    """`rest` = text after "<lang". True for Notion's `<lang primary=...` opener or a
+    chunk-final prefix of it ("<lang", "<lang pri"); False for <language>, <lang>, <lang x=..>."""
+    if re.match(r"\s+primary\b", rest):
+        return True
+    if ">" in rest or "\n" in rest:
+        return False
+    if rest == "":
+        return True
+    if not rest[0].isspace():
+        return False
+    r = rest.lstrip()
+    return r == "" or "primary".startswith(r)
+
+
 def _strip_lang_tags(text: str, in_tag: list[bool]) -> str:
     """Strip Notion internal <lang ...> tags, including cross-chunk broken tags."""
     result = []
@@ -79,7 +94,11 @@ def _strip_lang_tags(text: str, in_tag: list[bool]) -> str:
             continue
 
         lang_start = text.find("<lang", i)
-        close_start = text.find("</lang>", i)
+        # only Notion's <lang ...> / <lang>, never <language>, <langs> etc.
+        # only Notion's <lang primary=...> (or a chunk-final prefix of it), never <language>, <lang>
+        while lang_start != -1 and not _is_notion_lang_open(text[lang_start + 5:]):
+            lang_start = text.find("<lang", lang_start + 1)
+        close_start = -1  # </lang> is left to app.lang_sanitizer (code-fence aware)
         candidates = [(pos, typ) for pos, typ in [(lang_start, "open"), (close_start, "close")] if pos != -1]
         if not candidates:
             result.append(text[i:])
@@ -94,7 +113,12 @@ def _strip_lang_tags(text: str, in_tag: list[bool]) -> str:
 
         end = text.find(">", next_pos)
         if end == -1:
-            in_tag[0] = True
+            if re.match(r"\s+primary\b", text[next_pos + 5:]):
+                in_tag[0] = True  # certainly Notion's opener: swallow up to the next ">"
+            else:
+                # bare "<lang" / "<lang pri" at chunk end: could be `<lang>` or <language> in prose;
+                # app.lang_sanitizer holds it statefully and decides once it resolves
+                result.append(text[next_pos:])
             break
         i = end + 1
 
@@ -115,7 +139,7 @@ def _clean_notion_markup(text: str) -> str:
     # 完整 <lang ...>内容</lang>：保留内容，剥掉标签
     text = _RE_LANG_FULL.sub(r"\1", text)
     # 移除孤立的 </lang>
-    text = _RE_LANG_CLOSE.sub("", text)
+    # </lang> is removed (outside code only) by app.lang_sanitizer
     # 移除孤立的 <lang ...> 开标签
     text = _RE_LANG_OPEN.sub("", text)
     # 移除 primary="zh-CN" 之类的属性残片

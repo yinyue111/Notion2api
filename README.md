@@ -7,7 +7,11 @@
 - **OpenAI 兼容接口**：`POST /v1/chat/completions`、`POST /v1/responses`、`GET /v1/models`，支持流式（SSE）与非流式。
 - **工具调用模拟（Tool Calling）**：将模型输出中的 `<tool_call>` 解析为原生 `tool_calls`；支持流式输出；上游静默时每 5 秒发送 keepalive 数据块，避免中转断流；客户端断开时主动取消上游请求。
 - **模型映射**：`opus5.5`、`sonnet5.5`、`haiku5.5`（及 `claude-*` 前缀）、GPT 系列等友好名称映射到 Notion 内部模型；支持推理强度后缀 `-low` / `-medium` / `-high` / `-xhigh` / `-max`。
-- **多账号池**：多个 Notion 账号轮询，带请求节流（pacing）与限流退避（backoff）。
+- **多账号池与故障转移**：默认轮询；`ACCOUNT_STRATEGY=priority` 时按 `ACCOUNT_PRIORITY` 主账号优先，检测到额度耗尽/限流自动切换到下一个账号，并定期复查恢复；带请求节流与限流退避。
+- **线程复用（Prompt 缓存）**：`ENABLE_THREAD_REUSE=1` 时多轮对话续用同一 Notion 线程，只发送增量消息，提高上游缓存命中、降低延迟。
+- **长消息切分**：超过 `NOTION_SPLIT_LONG_USER_CHARS` 的用户消息自动分段发送。
+- **人设守护与输出清理**：检测回复自称 Notion AI 时自动重试（`NOTION_PERSONA_GUARD`），清除语言标签与关于指令的元评论。
+- **OpenAI 兼容细节**：支持 `stop`、`max_tokens` / `max_completion_tokens`（超限 `finish_reason=length`）、`response_format`（`json_object` / `json_schema`），错误返回 OpenAI 标准 `{"error": {...}}` 格式。
 - **身份脱敏**：不泄露 Notion 账号信息，也不暴露 Notion AI 自身人设。
 - **工具模式稳定性**：工具模式下关闭 Notion 内置联网工具；上游流无输出关闭时，从会话线程记录中恢复推理结果。
 - **真实用量透传**：返回上游真实的 token 用量（usage）。
@@ -48,6 +52,10 @@ python main.py
 | `TOOL_MODE_NOTION_WEB` / `TOOL_MODE_DEFANG_URLS` | 工具模式下 Notion 联网与 URL 处理 |
 | `REDACT_ACCOUNT_IDENTITY` | 身份脱敏开关 |
 | `NOTION_MIN_REQUEST_INTERVAL` / `NOTION_RATE_LIMIT_BACKOFF` | 节流与退避 |
+| `ENABLE_THREAD_REUSE` / `THREAD_REUSE_*` | 线程复用 |
+| `ACCOUNT_STRATEGY` / `ACCOUNT_PRIORITY` / `ACCOUNT_EXHAUSTED_RECHECK_SECONDS` | 账号调度与故障转移 |
+| `NOTION_SPLIT_LONG_USER_CHARS` | 长消息切分阈值 |
+| `NOTION_DEFAULT_SYSTEM_PROMPT` / `NOTION_PERSONA_GUARD` | 默认系统提示 / 人设守护 |
 | `NOTION_USE_INSTRUCTIONS_PAGE` / `NOTION_INSTRUCTIONS_PAGE_ID` | AI 指令页（见下） |
 
 ## 调用示例

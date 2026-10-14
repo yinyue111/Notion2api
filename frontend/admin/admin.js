@@ -113,12 +113,14 @@
       { t: '邮箱', f: (r) => r.user_email || '—' },
       { t: 'space_id', f: (r) => (r.space_id || '').slice(0, 8) + '…' },
       { t: 'token', k: 'token_hint' },
-      { t: '状态', f: (r) => !r.enabled ? h('span', { class: 'badge' }, '已停用') : r.cooling_seconds > 0 ? h('span', { class: 'badge warn' }, `冷却 ${r.cooling_seconds}s`) : h('span', { class: 'badge ok' }, '启用') },
+      { t: '状态', f: (r) => !r.enabled ? h('span', { class: 'badge' }, '已停用') : (r.pool_status && r.pool_status.state === 'exhausted') ? h('span', { class: 'badge bad', title: (r.pool_status.exhausted_reason || '') + ' / 复查 ' + ts(r.pool_status.exhausted_until) }, '额度耗尽') : r.cooling_seconds > 0 ? h('span', { class: 'badge warn' }, `冷却 ${r.cooling_seconds}s`) : h('span', { class: 'badge ok' }, '启用') },
+      { t: '优先级', f: (r) => r.pool_status ? `${r.pool_status.priority}${r.pool_status.is_primary ? ' (当前)' : ''}` : '—' },
       { t: '最近测试', f: (r) => r.last_test_at ? h('span', { class: 'badge ' + (r.last_test_ok ? 'ok' : 'bad'), title: ts(r.last_test_at) }, r.last_test_msg || (r.last_test_ok ? 'OK' : '失败')) : '—' },
       { t: '额度', f: (r) => h('span', { title: r.last_credits_at ? '更新于 ' + ts(r.last_credits_at) : '' }, creditsText(r.credits)) },
       { t: '操作', f: (r) => h('div', { class: 'actions' },
           h('button', { class: 'btn small', onclick: () => accAction(r.id, 'test') }, '测试'),
           h('button', { class: 'btn small', onclick: () => accAction(r.id, 'credits') }, '额度'),
+          r.pool_status ? h('button', { class: 'btn small', onclick: () => setExhausted(r, r.pool_status.state !== 'exhausted') }, r.pool_status.state === 'exhausted' ? '恢复' : '标记耗尽') : null,
           h('button', { class: 'btn small', onclick: () => toggleAcc(r) }, r.enabled ? '停用' : '启用'),
           h('button', { class: 'btn small', onclick: () => openAccDialog(r) }, '编辑'),
           h('button', { class: 'btn small danger', onclick: () => delAcc(r) }, '删除')) },
@@ -131,6 +133,7 @@
     } catch (e) { toast(e.status === 429 ? `操作太频繁，${(e.body && e.body.retry_after) || ''} 秒后再试` : e.message); }
     loadAccounts().catch(() => { });
   }
+  async function setExhausted(r, ex) { try { await api(`/accounts/${r.id}/exhausted`, { method: 'POST', body: JSON.stringify({ exhausted: ex }) }); } catch (e) { toast(e.message); } loadAccounts(); }
   async function toggleAcc(r) { try { await api(`/accounts/${r.id}`, { method: 'PATCH', body: JSON.stringify({ enabled: !r.enabled }) }); } catch (e) { toast(e.message); } loadAccounts(); }
   async function delAcc(r) { if (!confirm(`确定删除账号 #${r.id} ${r.label || r.user_email || ''}？`)) return; try { await api(`/accounts/${r.id}`, { method: 'DELETE' }); toast('已删除'); } catch (e) { toast(e.message); } loadAccounts(); }
   function openAccDialog(r) {

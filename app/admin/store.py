@@ -50,6 +50,9 @@ class AdminStore:
         c = self._conn()
         c.execute("PRAGMA journal_mode=WAL")
         c.executescript(SCHEMA)
+        cols = [r[1] for r in c.execute("PRAGMA table_info(request_log)")]
+        if "thread_reuse" not in cols:
+            c.execute("ALTER TABLE request_log ADD COLUMN thread_reuse TEXT")
         c.commit()
         try:
             os.chmod(path, 0o600)
@@ -212,7 +215,7 @@ class AdminStore:
 
     _LOG_COLS = ("ts", "ip", "method", "path", "model", "stream", "status", "latency_ms", "ttfb_ms", "account",
                  "auth", "prompt_tokens", "cached_tokens", "completion_tokens", "usage_reported",
-                 "error_code", "error_message")
+                 "error_code", "error_message", "thread_reuse")
 
     def _writer(self) -> None:
         last_purge = 0.0

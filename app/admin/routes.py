@@ -117,12 +117,35 @@ class AccountPatch(BaseModel):
 
 @router.get("/accounts")
 async def list_accounts(request: Request, _: dict = Depends(require_session)):
-    cooling = request.app.state.account_pool.cooling_map()
+    pool = request.app.state.account_pool
+    cooling = pool.cooling_map()
+    status = pool.status_map()
     items = _store(request).list_accounts()
     for a in items:
         a["in_pool"] = a["id"] in cooling
         a["cooling_seconds"] = cooling.get(a["id"], 0)
-    return {"items": items}
+        a["pool_status"] = status.get(a["id"])
+    from app.account_pool import strategy
+    return {"items": items, "strategy": strategy()}
+
+
+class ExhaustedBody(BaseModel):
+    exhausted: bool
+    seconds: Optional[int] = Field(default=None, ge=10, le=7 * 86400)
+
+
+@router.post("/accounts/{acc_id}/exhausted")
+async def set_exhausted(acc_id: int, request: Request, body: ExhaustedBody, _: dict = Depends(require_session)):
+    """Manually mark an account out of credits (fail over to the next one) or clear it."""
+    pool = request.app.state.account_pool
+    c = next((c for c in pool.clients if getattr(c, "admin_id", None) == acc_id), None)
+    if c is None:
+        raise HTTPException(404, "account not in pool")
+    if body.exhausted:
+        pool.mark_exhausted(c, body.seconds, reason="manual (admin)")
+    else:
+        pool.clear_exhausted(c)
+    return {"ok": True, "status": pool.status_map().get(acc_id)}
 
 
 @router.post("/accounts")
@@ -216,6 +239,9 @@ async def account_credits(acc_id: int, request: Request, _: dict = Depends(requi
         raise HTTPException(502, f"Notion returned HTTP {status}")
     credits = _pick_credits(body)
     _store(request).set_credits(acc_id, credits)
+    if credits.get("isEligible") is False:
+        pool = request.app.state.account_pool
+        pool.mark_exhausted(client, reason="credits lookup: not eligible")
     return {"ok": True, "credits": credits}
 
 

@@ -84,9 +84,46 @@ app.state.limiter = limiter
 def custom_rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded):
     return JSONResponse(
         status_code=429,
-        content={"error": "Too many requests, please try again later"}
+        content={"error": {"message": "Too many requests, please try again later", "type": "rate_limit_error",
+                           "param": None, "code": "rate_limit_exceeded"}}
     )
 app.add_exception_handler(RateLimitExceeded, custom_rate_limit_exceeded_handler)
+
+
+from fastapi import HTTPException as _HTTPException
+from fastapi.exceptions import RequestValidationError as _RVE
+
+
+@app.exception_handler(_HTTPException)
+async def openai_http_exception_handler(request: Request, exc: _HTTPException):
+    """OpenAI-style error body for API routes (admin keeps FastAPI's {"detail": ...})."""
+    if not request.url.path.startswith("/v1"):
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=getattr(exc, "headers", None))
+    if isinstance(exc.detail, dict) and "error" in exc.detail:
+        content = exc.detail
+    else:
+        code = {400: "invalid_request", 401: "invalid_api_key", 403: "permission_denied", 404: "not_found",
+                429: "rate_limit_exceeded"}.get(exc.status_code, "error")
+        typ = "invalid_request_error" if exc.status_code < 500 else "server_error"
+        content = {"error": {"message": str(exc.detail), "type": typ, "param": None, "code": code}}
+    return JSONResponse(status_code=exc.status_code, content=content, headers=getattr(exc, "headers", None))
+
+
+@app.exception_handler(_RVE)
+async def openai_validation_handler(request: Request, exc: _RVE):
+    if not request.url.path.startswith("/v1"):
+        from fastapi.exception_handlers import request_validation_exception_handler
+        return await request_validation_exception_handler(request, exc)
+    errs = exc.errors()
+    first = errs[0] if errs else {}
+    loc = [str(x) for x in (first.get("loc") or []) if x != "body"]
+    msg = first.get("msg") or "Invalid request"
+    if first.get("type") == "json_invalid":
+        msg = "We could not parse the JSON body of your request."
+    return JSONResponse(status_code=400, content={"error": {
+        "message": (f"{'.'.join(loc)}: " if loc and first.get("type") != "json_invalid" else "") + msg,
+        "type": "invalid_request_error", "param": ".".join(loc) or None,
+        "code": "invalid_json" if first.get("type") == "json_invalid" else "invalid_value"}})
 
 
 @app.exception_handler(Exception)

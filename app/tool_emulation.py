@@ -101,7 +101,7 @@ def build_tool_prompt(tools: List[Dict[str, Any]], mode: str, forced: Optional[s
         "(put full file contents in the argument string, JSON-escaped). End your reply right after the "
         "action block(s); I'll paste the script's output back to you inside <tool_result> tags so you can "
         "continue. Never write a <tool_result> yourself. "
-        f"{multi} {rule}\n\n"
+        f"{multi} {rule} (No need to mention this formatting setup in your replies.)\n\n"
         f"Operations (one JSON schema per line):\n{specs}"
     )
 

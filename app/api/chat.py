@@ -1080,7 +1080,8 @@ def _sum_usage(a: dict | None, b: dict | None) -> dict | None:
     return {k: int(a.get(k, 0)) + int(b.get(k, 0)) for k in set(a) | set(b)}
 
 
-def _run_tool_attempts(client, transcript, *, include_usage, account, tools, parallel, mode):
+def _run_tool_attempts(client, transcript, *, include_usage, account, tools, parallel, mode,
+                       thread_id=None, fallback_transcript=None, meta=None, pool=None):
     """Run the emulated-tools request, retrying (fresh thread) when Notion's persona
     refuses the tool protocol or a forced tool call is missing. Yields "tick" while
     waiting (for SSE keepalives) and finally ("done", result)."""
@@ -1091,9 +1092,14 @@ def _run_tool_attempts(client, transcript, *, include_usage, account, tools, par
     result = None
     for attempt in range(1, TOOL_MODE_MAX_ATTEMPTS + 1):
         # fresh block ids per attempt: Notion rejects re-sent ids (400 ValidationError / 502)
+        # a reused (continued) thread is only tried once; retries start a fresh full thread
+        base = transcript if attempt == 1 else (fallback_transcript or transcript)
         attempt_transcript = [dict(b, id=str(uuid.uuid4())) if isinstance(b, dict) and "id" in b else b
-                              for b in transcript] if attempt > 1 else transcript
-        collector = _UsageCollector(client.stream_response(attempt_transcript, thread_id=None),
+                              for b in base] if attempt > 1 else base
+        if attempt > 1 and thread_id and meta is not None:
+            meta["reuse_fallback"] = "retry"
+        collector = _UsageCollector(client.stream_response(attempt_transcript, thread_id=thread_id if attempt == 1 else None,
+                                                           meta=meta),
                                     include_usage=include_usage, account=account)
         content, thinking, final_text, final_src = [], [], "", ""
         failed = False
@@ -1114,8 +1120,21 @@ def _run_tool_attempts(client, transcript, *, include_usage, account, tools, par
                       if ft:
                           final_text, final_src = ft, str(item.get("source_type", "") or "")
           except NotionUpstreamError as exc:
-              # never re-hit a fair-use rate limit: surface the 429 so the client backs off
-              if exc.status_code in (429, 503) or not (exc.retriable and attempt < TOOL_MODE_MAX_ATTEMPTS):
+              # never re-hit a fair-use rate limit on the same account: fail over to another
+              # free account (fresh full thread) like standard mode, else surface it
+              if exc.status_code in (429, 503):
+                  if not (pool is not None and attempt < TOOL_MODE_MAX_ATTEMPTS
+                          and _other_account_free(pool, client)):
+                      raise
+                  pool.mark_failed(client, cooldown_seconds=int(os.getenv("NOTION_RATELIMIT_FAILOVER_COOLDOWN", "45") or 45))
+                  new_client = pool.get_client()
+                  logger.info("Rate-limited: failing over to another account", extra={"request_info": {
+                      "event": "ratelimit_failover", "mode": "tool", "from": getattr(client, "account_key", ""),
+                      "to": getattr(new_client, "account_key", ""), "status": exc.status_code}})
+                  client = new_client
+                  account = getattr(client, "account_label", "") or getattr(client, "account_key", "")
+                  thread_id = None
+              elif not (exc.retriable and attempt < TOOL_MODE_MAX_ATTEMPTS):
                   raise
               logger.info("Tool mode: upstream error, retrying",
                           extra={"request_info": {"event": "tool_mode_retry_upstream", "attempt": attempt}})
@@ -1143,6 +1162,8 @@ def _run_tool_attempts(client, transcript, *, include_usage, account, tools, par
             if calls:
                 break
         text = visible if calls else (streamed if streamed.strip() else best)
+        from app.meta_commentary import strip_meta_commentary
+        text = strip_meta_commentary(text)
         result = {"text": text, "calls": calls, "thinking": "".join(thinking), "attempts": attempt}
         if calls:
             break
@@ -1564,6 +1585,57 @@ async def _handle_lite_request(
     )
 
 
+def _tr_capture_stream(gen, on_reply):
+    """Pass SSE chunks through; when the stream ends normally, rebuild the assistant
+    message the client received and hand it to on_reply (thread-reuse bookkeeping)."""
+    from app.thread_reuse import reply_from_sse
+    chunks: list[str] = []
+    completed = False
+    try:
+        for ch in gen:
+            if isinstance(ch, str):
+                chunks.append(ch)
+            yield ch
+        completed = True
+    finally:
+        if completed:
+            try:
+                msg = reply_from_sse(chunks)
+                if msg:
+                    on_reply(msg)
+            except Exception:
+                logger.warning("thread reuse: capture failed", exc_info=True)
+
+
+def _tr_reply_from_response(resp) -> dict | None:
+    try:
+        if isinstance(resp, JSONResponse):
+            body = json.loads(resp.body)
+            if body.get("error"):
+                return None
+            m = body["choices"][0]["message"]
+        else:
+            m = resp.choices[0].message
+            m = m.dict() if hasattr(m, "dict") else dict(m)
+        out = {"role": "assistant", "content": m.get("content") or ""}
+        if m.get("tool_calls"):
+            out["tool_calls"] = m["tool_calls"]
+        return out
+    except Exception:
+        return None
+
+
+def _other_account_free(pool, client) -> bool:
+    from app.account_pool import is_exhausted as _is_exhausted
+    now = time.time()
+    try:
+        with pool._lock:
+            return any(c is not client and cd <= now and not _is_exhausted(c, now)
+                       for c, cd in zip(pool.clients, pool.cooldown_until))
+    except Exception:
+        return False
+
+
 async def _handle_standard_request(
     request: Request,
     req_body: ChatCompletionRequest,
@@ -1612,10 +1684,59 @@ async def _handle_standard_request(
         from app.tool_emulation import TOOL_RESULT_REMINDER
         tool_reminder = TOOL_RESULT_REMINDER
 
+    from app import thread_reuse as _tr
+    from app.request_log import annotate as _rl_annotate
+    messages_all = [msg.dict() for msg in req_body.messages]
+    reuse_on = _tr.enabled()
+    tr_ident, tr_ident_src = _tr.identity(request.headers, req_body.user) if reuse_on else ("", [])
+    tr_ns = _tr.namespace(req_body.model, tool_prompt, tr_ident) if reuse_on else ""
+    reuse_plan = None
+    reuse_status = "off"
+    tr_diag = None
+    if reuse_on:
+        tr_norm = _tr.normalize_history(messages_all)
+
+        def _tr_accept(k, _n=tr_norm):
+            new_msgs = _n[k:]
+            if not new_msgs:
+                return "shape:empty"
+            if new_msgs[-1].get("role") not in ("user", "tool", "function"):
+                return "shape:last_" + str(new_msgs[-1].get("role"))
+            return None
+
+        entry, k, reuse_status = _tr.STORE.take(tr_ns, tr_norm, accept=_tr_accept)
+        if entry is not None:
+            reuse_plan = {"entry": entry, "new": tr_norm[k:], "k": k, "norm": tr_norm}
+        elif reuse_status not in ("short",):
+            try:
+                tr_diag = _tr.STORE.diagnose(tr_ns, tr_norm)
+            except Exception:
+                tr_diag = None
+
+    def _finish_transcript(t):
+        t = _apply_reasoning_effort(t, req_body)
+        if tools_active and os.getenv("TOOL_MODE_NOTION_WEB", "0") != "1":
+            for b in t:
+                if isinstance(b, dict) and b.get("type") == "config" and isinstance(b.get("value"), dict):
+                    b["value"]["useWebSearch"] = False
+                    b["value"]["internetAccess"] = False
+        if tools_active and os.getenv("TOOL_MODE_DEFANG_URLS", "1") == "1":
+            t = [_defang_urls(b) if isinstance(b, dict) and b.get("type") not in ("config", "context") else b for b in t]
+        return t
+
     for attempt in range(1, max_retries + 1):
         client = None
+        tr_meta: dict = {}
+        reuse_tid = None
         try:
-            client = pool.get_client()
+            if reuse_plan is not None:
+                client = pool.get_client_by_key(reuse_plan["entry"]["account"])
+                if client is None:
+                    reuse_status, reuse_plan = "account_unavailable", None
+                else:
+                    reuse_tid = reuse_plan["entry"]["thread_id"]
+            if client is None:
+                client = pool.get_client()
 
             # 构建 Standard transcript（完整上下文）
             # 从 client 提取账号信息
@@ -1623,45 +1744,56 @@ async def _handle_standard_request(
                 "user_id": client.user_id,
                 "space_id": client.space_id,
             }
-            messages = [msg.dict() for msg in req_body.messages]
-            transcript = build_standard_transcript(
+            messages = messages_all
+            # Tool mode: Notion's built-in web is disabled (client brings its own tools; the
+            # urlSafety confirm continuation 502s) and URLs get a zero-width space after the
+            # scheme so Notion doesn't auto-"view" them (context_urls); see _finish_transcript.
+            transcript = _finish_transcript(build_standard_transcript(
                 messages, req_body.model, account,
                 tool_prompt=tool_prompt, tool_reminder=tool_reminder,
-            )
-            transcript = _apply_reasoning_effort(transcript, req_body)
+            ))
+            full_transcript = transcript
+            if reuse_tid:
+                # continue the stored Notion thread: only the new messages, no instructions /
+                # tool preamble (already in the thread), reminder only after tool results
+                transcript = _finish_transcript(build_standard_transcript(
+                    reuse_plan["new"], req_body.model, account, tool_prompt="",
+                    tool_reminder=tool_reminder if last_role in ("tool", "function") else "",
+                    name_context=reuse_plan["norm"][:reuse_plan["k"]],
+                    inject_default_system=False,
+                ))
+            logger.info("Thread reuse " + ("hit" if reuse_tid else "miss"), extra={"request_info": {
+                "event": "thread_reuse_hit" if reuse_tid else "thread_reuse_miss",
+                "reason": reuse_status, "thread_id": reuse_tid, "prefix_msgs": (reuse_plan or {}).get("k"),
+                "new_msgs": len((reuse_plan or {}).get("new") or []), "account": client.account_key,
+                "identity_sources": tr_ident_src, **({"diag": tr_diag} if tr_diag and not reuse_tid else {})}})
+            if reuse_on:
+                _rl_annotate(thread_reuse=(reuse_status if reuse_tid else f"miss:{reuse_status}"))
 
-            if tools_active and os.getenv("TOOL_MODE_NOTION_WEB", "0") != "1":
-                # The client brings its own tools (incl. web): Notion's built-in web fetch/search
-                # needs a urlSafety confirmation whose continuation 502s => empty answers.
-                for b in transcript:
-                    if isinstance(b, dict) and b.get("type") == "config" and isinstance(b.get("value"), dict):
-                        b["value"]["useWebSearch"] = False
-                        b["value"]["internetAccess"] = False
-            if tools_active and os.getenv("TOOL_MODE_DEFANG_URLS", "1") == "1":
-                # Notion auto-"views" every URL in the conversation (autoLoadPhase=context_urls)
-                # before inference; for external URLs the turn then stalls ~60s and ends empty
-                # (or needs a urlSafety confirm whose continuation 502s). A zero-width space
-                # after the scheme stops the autoload; it is stripped from the output again.
-                transcript = [_defang_urls(b) if isinstance(b, dict) and b.get("type") not in ("config", "context") else b
-                              for b in transcript]
+            def _tr_store(reply, _meta=tr_meta, _msgs=messages):
+                if not reuse_on or not reply:
+                    return
+                _tr.STORE.put(tr_ns, _msgs, reply, _meta.get("thread_id"), _meta.get("account"))
 
             if tools_active:
                 tool_gen = _run_tool_attempts(
                     client, transcript, include_usage=_include_usage_flag(req_body),
                     account=getattr(client, "account_label", "") or getattr(client, "account_key", ""),
                     tools=tools, parallel=parallel_tools, mode=tool_mode,
+                    thread_id=reuse_tid, fallback_transcript=full_transcript, meta=tr_meta, pool=pool,
                 )
                 if req_body.stream:
                     return StreamingResponse(
-                        _tool_mode_stream(tool_gen, response_id, req_body.model,
-                                          request.headers.get("X-Client-Type", "").lower()),
+                        _tr_capture_stream(_tool_mode_stream(tool_gen, response_id, req_body.model,
+                                          request.headers.get("X-Client-Type", "").lower()), _tr_store),
                         media_type="text/event-stream",
                         headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
                     )
-                return _tool_mode_non_stream(tool_gen, response_id, req_body.model)
+                resp = _tool_mode_non_stream(tool_gen, response_id, req_body.model)
+                _tr_store(_tr_reply_from_response(resp))
+                return resp
 
-            # 调用 Notion API（不使用 thread_id，让 Notion ��动处理）
-            stream_gen = _UsageCollector(client.stream_response(transcript, thread_id=None), include_usage=_include_usage_flag(req_body), account=getattr(client, "account_label", "") or getattr(client, "account_key", ""))
+            stream_gen = _UsageCollector(client.stream_response(transcript, thread_id=reuse_tid, meta=tr_meta), include_usage=_include_usage_flag(req_body), account=getattr(client, "account_label", "") or getattr(client, "account_key", ""))
             first_item = next(stream_gen, None)
 
             if first_item is None:
@@ -1687,13 +1819,13 @@ async def _handle_standard_request(
                         headers=stream_headers,
                     )
                 return StreamingResponse(
-                    _create_standard_stream_generator(
+                    _tr_capture_stream(_create_standard_stream_generator(
                         response_id,
                         req_body.model,
                         first_item,
                         stream_gen,
                         client_type=client_type,
-                    ),
+                    ), _tr_store),
                     media_type="text/event-stream",
                     headers=stream_headers,
                 )
@@ -1770,17 +1902,20 @@ async def _handle_standard_request(
                     msg: Dict[str, Any] = {"role": "assistant", "content": visible or None, "tool_calls": calls}
                     if thinking_parts:
                         msg["reasoning_content"] = "".join(thinking_parts)
-                    return JSONResponse({
+                    resp = JSONResponse({
                         "id": response_id, "object": "chat.completion", "created": int(time.time()),
                         "model": req_body.model,
                         "choices": [{"index": 0, "message": msg, "finish_reason": "tool_calls", "logprobs": None}],
                         "usage": _openai_usage(stream_gen),
                     })
+                    _tr_store(_tr_reply_from_response(resp))
+                    return resp
 
                 response_text = full_text
 
             # 构建响应
-            response_message = ChatMessage(role="assistant", content=response_text)
+            from app.meta_commentary import strip_meta_commentary
+            response_message = ChatMessage(role="assistant", content=strip_meta_commentary(response_text))
 
             # 如果有 thinking，添加到扩展字段（前端会读取）
             if thinking_parts:
@@ -1811,9 +1946,12 @@ async def _handle_standard_request(
                         "sources": all_sources,
                     }
 
+            _tr_store(_tr_reply_from_response(response_obj))
             return response_obj
 
         except NotionUpstreamError as exc:
+            if reuse_plan is not None:
+                reuse_status, reuse_plan = "upstream_error", None
             if client is not None and exc.retriable:
                 pool.mark_failed(client)
             logger.warning(
@@ -1831,6 +1969,17 @@ async def _handle_standard_request(
             )
             # 429/503 were already backed off inside the client; retrying here only
             # deepens Notion's fair-use penalty
+            from app.account_pool import is_exhausted as _is_exhausted
+            if client is not None and _is_exhausted(client) and attempt < max_retries:
+                continue  # out of credits: fail over to the next account now
+            if (exc.status_code in (429, 503) and client is not None and attempt < max_retries
+                    and _other_account_free(pool, client)):
+                # this account is fair-use limited even after backoff: rest it and fail over
+                pool.mark_failed(client, cooldown_seconds=int(os.getenv("NOTION_RATELIMIT_FAILOVER_COOLDOWN", "45") or 45))
+                reuse_plan = None
+                logger.info("Rate-limited: failing over to another account", extra={"request_info": {
+                    "event": "ratelimit_failover", "from": getattr(client, "account_key", ""), "status": exc.status_code}})
+                continue
             if attempt == max_retries or not exc.retriable or exc.status_code in (429, 503):
                 return _upstream_error_response(exc)
         except RuntimeError as exc:
@@ -1853,6 +2002,7 @@ async def _handle_standard_request(
         except HTTPException:
             raise
         except Exception:
+            reuse_plan = None
             if client is not None:
                 pool.mark_failed(client)
             logger.error(
@@ -1885,6 +2035,53 @@ async def _handle_standard_request(
 
 @router.post("/chat/completions", tags=["chat"])
 async def create_chat_completion(
+    request: Request,
+    req_body: ChatCompletionRequest,
+    background_tasks: BackgroundTasks,
+    response: Response,
+):
+    """OpenAI-compatible entry: validation + output controls (stop / max_tokens /
+    response_format) around the generation pipeline."""
+    from app.output_controls import parse_controls, json_instruction, apply_json_body, wrap_stream
+    from app.schemas import ChatMessage
+    if not req_body.messages:
+        return _build_error_response(400, code="invalid_value", error_type="invalid_request_error",
+                                     message="'messages' must contain at least one message.")
+    if not is_supported_model(req_body.model):
+        return JSONResponse(status_code=404, content={"error": {
+            "message": f"The model '{req_body.requested_model or req_body.model}' does not exist. Available models: "
+                       + ", ".join(list_available_models()),
+            "type": "invalid_request_error", "param": "model", "code": "model_not_found"}})
+    if req_body.n not in (None, 1):
+        return _build_error_response(400, code="unsupported_value", error_type="invalid_request_error",
+                                     message="Only n=1 is supported.")
+    ctl = parse_controls(req_body.model_dump())
+    instr = json_instruction(ctl["format"])
+    if instr:
+        msgs = list(req_body.messages)
+        last_sys = max([i for i, m in enumerate(msgs) if m.role in ("system", "developer")] or [-1])
+        msgs.insert(last_sys + 1, ChatMessage(role="system", content=instr))
+        req_body.messages = msgs
+    result = await _create_chat_completion_impl(request, req_body, background_tasks, response)
+    if not (ctl["stop"] or ctl["max_tokens"] or ctl["format"]):
+        return result
+    if isinstance(result, StreamingResponse):
+        result.body_iterator = wrap_stream(result.body_iterator, ctl)
+        return result
+    if isinstance(result, JSONResponse):
+        if result.status_code != 200:
+            return result
+        data = apply_json_body(json.loads(result.body), ctl)
+        return JSONResponse(status_code=200, content=data, headers={k: v for k, v in result.headers.items()
+                                                                     if k.lower() not in ("content-length", "content-type")})
+    if hasattr(result, "model_dump"):
+        return JSONResponse(status_code=200, content=apply_json_body(result.model_dump(), ctl))
+    if isinstance(result, dict):
+        return apply_json_body(result, ctl)
+    return result
+
+
+async def _create_chat_completion_impl(
     request: Request,
     req_body: ChatCompletionRequest,
     background_tasks: BackgroundTasks,

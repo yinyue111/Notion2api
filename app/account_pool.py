@@ -1,9 +1,22 @@
+import os
 import time
 import threading
 from typing import Dict, List
 
 from app.logger import logger
 from app.notion_client import NotionOpusAPI
+
+def strategy() -> str:
+    return os.getenv("ACCOUNT_STRATEGY", "round_robin").strip().lower()
+
+
+def exhaust_seconds() -> float:
+    return float(os.getenv("ACCOUNT_EXHAUSTED_RECHECK_SECONDS", "1800") or 1800)
+
+
+def is_exhausted(client, now: float | None = None) -> bool:
+    return (getattr(client, "exhausted_until", 0) or 0) > (now or time.time())
+
 
 class AccountPool:
     def __init__(self, accounts: List[dict]):
@@ -19,6 +32,7 @@ class AccountPool:
         # 轮询索引
         self._current_index = 0
         self._lock = threading.Lock()
+        self._last_primary = None
 
     @staticmethod
     def _fp(acc: dict) -> tuple:
@@ -56,6 +70,8 @@ class AccountPool:
         如果 wait_if_cooling=True（默认），当所有账号都在冷却时，
         会等待最近的冷却结束后返回，而不是抛异常。
         """
+        if strategy() == "priority":
+            return self._get_priority(wait_if_cooling)
         now = time.time()
         with self._lock:
             if not self.clients:
@@ -67,8 +83,9 @@ class AccountPool:
                     raise RuntimeError("没有可用的 Notion 账号，请在管理面板中添加或启用账号。")
                 self._current_index %= len(self.clients)
                 idx = self._current_index
-                # 如果过了冷却时间，视为可用
-                if self.cooldown_until[idx] <= now:
+                # 如果过了冷却时间，视为可用（额度耗尽的账号在还有其他账号时跳过）
+                if self.cooldown_until[idx] <= now and not (is_exhausted(self.clients[idx], now)
+                                                           and any(not is_exhausted(c, now) for c in self.clients)):
                     # 轮询步进
                     self._current_index = (self._current_index + 1) % len(self.clients)
                     return self.clients[idx]
@@ -143,3 +160,84 @@ class AccountPool:
                     "Attempted to mark unknown account as failed",
                     extra={"request_info": {"event": "account_failed_unknown"}},
                 )
+
+    # ---------------- priority / failover ----------------
+    def ordered_indices(self) -> List[int]:
+        """Priority order: ACCOUNT_PRIORITY (comma list of admin ids, labels or emails),
+        remaining accounts in admin-panel order."""
+        prio = [x.strip().lower() for x in os.getenv("ACCOUNT_PRIORITY", "").split(",") if x.strip()]
+
+        def rank(i: int):
+            c = self.clients[i]
+            names = {str(getattr(c, "admin_id", "")).lower(), str(getattr(c, "account_label", "")).lower(),
+                     str(getattr(c, "account_key", "")).lower()}
+            for r, p in enumerate(prio):
+                if p in names:
+                    return (r, i)
+            return (len(prio), i)
+        return sorted(range(len(self.clients)), key=rank)
+
+    def _get_priority(self, wait_if_cooling: bool) -> NotionOpusAPI:
+        while True:
+            now = time.time()
+            with self._lock:
+                if not self.clients:
+                    raise RuntimeError("没有可用的 Notion 账号，请在管理面板中添加或启用账号。")
+                order = self.ordered_indices()
+                cands = [i for i in order if not is_exhausted(self.clients[i], now)]
+                if not cands:  # all exhausted: try the one whose recheck comes first
+                    cands = sorted(order, key=lambda i: self.clients[i].exhausted_until)
+                free = [i for i in cands if self.cooldown_until[i] <= now]
+                if free:
+                    c = self.clients[free[0]]
+                    key = getattr(c, "account_key", "")
+                    if key != self._last_primary:
+                        logger.info("Account switch", extra={"request_info": {
+                            "event": "account_switch", "from": self._last_primary, "to": key,
+                            "strategy": "priority"}})
+                        self._last_primary = key
+                    return c
+                wait = max(0.5, min(self.cooldown_until[i] for i in cands) - now)
+            if not wait_if_cooling or wait > 15:
+                raise RuntimeError(f"所有账号冷却中，请在 {max(1, int(wait))} 秒后重试。")
+            time.sleep(wait)
+
+    def get_client_by_key(self, key: str):
+        """The client with this account_key if it is usable right now, else None."""
+        now = time.time()
+        with self._lock:
+            for c, cd in zip(self.clients, self.cooldown_until):
+                if getattr(c, "account_key", "") == key:
+                    return c if cd <= now and not is_exhausted(c, now) else None
+        return None
+
+    def mark_exhausted(self, client, seconds: float | None = None, reason: str = "") -> None:
+        secs = exhaust_seconds() if seconds is None else seconds
+        client.exhausted_until = time.time() + secs
+        client.exhausted_reason = reason[:200]
+        logger.warning("Account quota exhausted", extra={"request_info": {
+            "event": "account_exhausted", "account": getattr(client, "account_key", ""),
+            "recheck_in": int(secs), "reason": reason[:200]}})
+
+    def clear_exhausted(self, client) -> None:
+        client.exhausted_until = 0
+        client.exhausted_reason = ""
+        logger.info("Account quota cleared", extra={"request_info": {
+            "event": "account_exhausted_cleared", "account": getattr(client, "account_key", "")}})
+
+    def status_map(self) -> Dict[int, dict]:
+        now = time.time()
+        with self._lock:
+            order = self.ordered_indices()
+            out = {}
+            for rank, i in enumerate(order):
+                c = self.clients[i]
+                ex = is_exhausted(c, now)
+                out[getattr(c, "admin_id", None)] = {
+                    "state": "exhausted" if ex else ("cooling" if self.cooldown_until[i] > now else "active"),
+                    "priority": rank + 1,
+                    "exhausted_until": int(c.exhausted_until) if ex else None,
+                    "exhausted_reason": getattr(c, "exhausted_reason", "") if ex else "",
+                    "is_primary": strategy() == "priority" and getattr(c, "account_key", "") == self._last_primary,
+                }
+            return out

@@ -105,8 +105,9 @@ def convert_input(instructions: Optional[str], inp: Any, custom: set) -> List[Di
                 args = json.dumps({"input": item.get("input") or ""}, ensure_ascii=False)
             call = {"id": item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:24]}",
                     "type": "function", "function": {"name": item.get("name") or "", "arguments": args or "{}"}}
-            if msgs and msgs[-1]["role"] == "assistant" and msgs[-1].get("tool_calls") is not None:
-                msgs[-1]["tool_calls"].append(call)
+            if msgs and msgs[-1]["role"] == "assistant":
+                # text + calls of one turn = one assistant message (as chat/completions returns it)
+                msgs[-1].setdefault("tool_calls", []).append(call)
             else:
                 msgs.append({"role": "assistant", "content": "", "tool_calls": [call]})
         elif typ in ("function_call_output", "custom_tool_call_output"):
@@ -160,6 +161,19 @@ def _response_obj(rid: str, body: Dict[str, Any], output: List[Dict[str, Any]], 
     }
 
 
+def _text_format(text: Any) -> Optional[Dict[str, Any]]:
+    """Responses `text.format` -> chat `response_format`."""
+    fmt = (text or {}).get("format") if isinstance(text, dict) else None
+    if not isinstance(fmt, dict):
+        return None
+    if fmt.get("type") == "json_object":
+        return {"type": "json_object"}
+    if fmt.get("type") == "json_schema":
+        return {"type": "json_schema", "json_schema": {"name": fmt.get("name") or "schema",
+                                                       "schema": fmt.get("schema") or {}, "strict": fmt.get("strict")}}
+    return None
+
+
 @router.post("/responses", tags=["responses"])
 async def create_response(request: Request, response: Response):
     from app.api.chat import create_chat_completion  # late import: avoid cycles
@@ -192,6 +206,9 @@ async def create_response(request: Request, response: Response):
             parallel_tool_calls=body.get("parallel_tool_calls"),
             reasoning=body.get("reasoning") if isinstance(body.get("reasoning"), dict) else None,
             stream_options={"include_usage": True} if stream else None,
+            user=str(body.get("user") or body.get("safety_identifier") or body.get("prompt_cache_key") or "") or None,
+            max_tokens=body.get("max_output_tokens") if isinstance(body.get("max_output_tokens"), int) else None,
+            response_format=_text_format(body.get("text")),
         )
     except Exception as exc:  # pydantic validation
         return _err(400, f"Invalid input: {str(exc)[:300]}", "input", code="invalid_value")
@@ -217,7 +234,13 @@ async def create_response(request: Request, response: Response):
             output.append(_call_item(call, custom))
         if not output:
             output.append(_message_item(""))
-        return JSONResponse(_response_obj(rid, body, output, _usage(data.get("usage")), "completed", created))
+        fin = (data.get("choices") or [{}])[0].get("finish_reason")
+        robj = _response_obj(rid, body, output, _usage(data.get("usage")), "incomplete" if fin == "length" else "completed", created)
+        if fin == "length":
+            robj["incomplete_details"] = {"reason": "max_output_tokens"}
+        if isinstance(body.get("text"), dict):
+            robj["text"] = body["text"]
+        return JSONResponse(robj)
 
     if not isinstance(result, StreamingResponse):
         return result  # error before streaming started
@@ -239,6 +262,7 @@ async def _translate_stream(chat_stream: StreamingResponse, rid: str, body: Dict
     msg = None          # open message item {id, text, index}
     calls: Dict[int, Dict[str, Any]] = {}  # chat tool index -> state
     finished = False
+    truncated = False
 
     yield ev("response.created", response=_response_obj(rid, body, [], None, "in_progress", created))
     yield ev("response.in_progress", response=_response_obj(rid, body, [], None, "in_progress", created))
@@ -328,6 +352,8 @@ async def _translate_stream(chat_stream: StreamingResponse, rid: str, body: Dict
                                          output_index=st["index"], delta=d)
                     if ch.get("finish_reason"):
                         finished = True
+                        if ch.get("finish_reason") == "length":
+                            truncated = True
     except Exception:
         logger.error("Responses stream translation failed", exc_info=True,
                      extra={"request_info": {"event": "responses_stream_error"}})
@@ -339,8 +365,10 @@ async def _translate_stream(chat_stream: StreamingResponse, rid: str, body: Dict
     for st in calls.values():
         for x in close_call(st):
             yield x
-    status = "completed" if finished else "incomplete"
+    status = "completed" if finished and not truncated else "incomplete"
     final = _response_obj(rid, body, output, usage, status, created)
+    if isinstance(body.get("text"), dict):
+        final["text"] = body["text"]
     if status == "incomplete":
-        final["incomplete_details"] = {"reason": "interrupted"}
+        final["incomplete_details"] = {"reason": "max_output_tokens" if truncated else "interrupted"}
     yield ev("response.completed" if status == "completed" else "response.incomplete", response=final)
