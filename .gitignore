@@ -1,0 +1,71 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Environment variables (SECURITY RISK)
+.env
+.env.*
+accounts.json
+
+# Data & Database
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Logs
+logs/
+*.log
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# AI Development Notes & Tools (SECURITY: Do not commit internal notes)
+AI-note/
+GEMINI.md
+CODEX.md
+CLAUDE.md
+ref/
+*.md.bak
+docs/PR_REVIEW_23_24_16.md
+
+# Backup and temporary files
+*.bak
+*backup*
+*.backup
+*-backup.*
+debug_*.log
+tmp_*.log
+*.tmp
+*.old
+
+# Test files (all tests directory)
+tests/
+test_*.py
+*_test.py
+debug_*.py
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Docker (Optional to ignore if you want to keep configs in git, usually we keep them)
+# But we definitely ignore local-specific overrides
+docker-compose.override.yml
+
+# Local cleanup folder
+0311_cleanup/
+
+
+# Response debug data (contains sensitive tokens)
+response/

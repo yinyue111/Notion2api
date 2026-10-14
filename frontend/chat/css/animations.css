@@ -1,0 +1,82 @@
+/* ============================================
+   Notion AI Studio — Animations
+   ============================================ */
+
+/* Pulse opacity for thinking indicator */
+@keyframes pulse-opacity {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+}
+
+/* Typing bounce dots */
+@keyframes typing-bounce {
+    0%, 80%, 100% {
+        transform: scale(0);
+        opacity: 0.4;
+    }
+    40% {
+        transform: scale(1);
+        opacity: 1;
+    }
+}
+
+/* Blinking cursor */
+@keyframes blink-cursor {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0; }
+}
+
+/* Fade in */
+@keyframes fade-in {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.fade-in {
+    animation: fade-in 0.3s ease forwards;
+}
+
+/* Slide in from left (sidebar) */
+@keyframes slide-in-left {
+    from { transform: translateX(-100%); }
+    to { transform: translateX(0); }
+}
+
+/* Modal scale in */
+@keyframes modal-in {
+    from { opacity: 0; transform: scale(0.96); }
+    to { opacity: 1; transform: scale(1); }
+}
+
+/* Snow particle */
+@keyframes snow-fall {
+    0% {
+        transform: translateY(-10vh) translateX(0);
+        opacity: 0;
+    }
+    10% { opacity: 1; }
+    90% { opacity: 1; }
+    100% {
+        transform: translateY(110vh) translateX(20px);
+        opacity: 0;
+    }
+}
+
+/* Rain line */
+@keyframes rain-fall {
+    0% {
+        transform: translateY(-10vh);
+        opacity: 0;
+    }
+    10% { opacity: 0.3; }
+    100% {
+        transform: translateY(110vh);
+        opacity: 0;
+    }
+}
+
+/* Star twinkle */
+@keyframes twinkle {
+    0%, 100% { opacity: 0.2; }
+    50% { opacity: 0.8; }
+}

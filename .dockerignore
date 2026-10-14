@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment & Secrets
+.env
+.env.*
+accounts.json
+
+# Data & Database
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Logs
+logs/
+*.log
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+docs/
+*.md
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Deployment configs (already in container context)
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Scripts (not needed in container)
+scripts/
+
+# Debug data
+response/
+AI-note/
+
+# OS
+.DS_Store
+Thumbs.db

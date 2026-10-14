@@ -1,0 +1,40 @@
+services:
+  notion-ai:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: notion2api:opus55-5882102
+    container_name: notion2api
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${HOST_PORT:-8095}:8000"
+    env_file:
+      - .env
+    environment:
+      - DB_PATH=/app/data/conversations.db
+      - PYTHONUNBUFFERED=1
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    networks:
+      - notion2api_net
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+networks:
+  notion2api_net:
+    name: notion2api_net
+    ipam:
+      config:
+        - subnet: 172.26.0.0/24

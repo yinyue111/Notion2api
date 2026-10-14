@@ -1,0 +1,251 @@
+"""Admin API (/admin/api/*): session login, accounts, overview, request log, stats."""
+import asyncio
+import sqlite3
+import threading
+import time
+from typing import Any, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+from app.admin import security as sec
+from app.logger import logger
+
+router = APIRouter()
+
+TEST_MIN_INTERVAL = 30
+CREDITS_MIN_INTERVAL = 60
+_last_call: dict[tuple, float] = {}
+_last_call_lock = threading.Lock()
+
+
+def _store(request: Request):
+    st = getattr(request.app.state, "admin_store", None)
+    if st is None:
+        raise HTTPException(503, "Admin store not configured (TOKEN_ENC_KEY missing)")
+    return st
+
+
+def require_session(request: Request) -> dict:
+    sess = sec.get_session(request)
+    if not sess:
+        raise HTTPException(401, "login required")
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        if not sec.same_origin(request):
+            raise HTTPException(403, "cross-origin request rejected")
+        if not sec.const_eq(request.headers.get("x-csrf-token", ""), sess["csrf"]):
+            raise HTTPException(403, "invalid CSRF token")
+    return sess
+
+
+def _reload_pool(request: Request) -> None:
+    request.app.state.account_pool.reload(_store(request).enabled_account_configs())
+
+
+class LoginBody(BaseModel):
+    username: str = Field(max_length=200)
+    password: str = Field(max_length=500)
+
+
+@router.post("/login")
+async def login(request: Request, body: LoginBody):
+    ip = sec.client_ip(request)
+    lock: sec.LoginLockout = request.app.state.admin_lockout
+    creds: sec.AdminCredentials = request.app.state.admin_creds
+    rem = lock.locked_for(ip)
+    if rem:
+        return JSONResponse({"error": "too many failed attempts", "retry_after": rem}, status_code=429,
+                            headers={"Retry-After": str(rem)})
+    if not sec.same_origin(request):
+        raise HTTPException(403, "cross-origin request rejected")
+    if not creds.configured:
+        raise HTTPException(503, "admin login not configured")
+    ok = await asyncio.to_thread(creds.check, body.username, body.password)
+    if not ok:
+        lock.record_failure(ip)
+        logger.warning("Admin login failed", extra={"request_info": {"event": "admin_login_failed", "ip": ip}})
+        rem = lock.locked_for(ip)
+        if rem:
+            return JSONResponse({"error": "too many failed attempts", "retry_after": rem}, status_code=429,
+                                headers={"Retry-After": str(rem)})
+        return JSONResponse({"error": "invalid username or password"}, status_code=401)
+    lock.clear(ip)
+    token, csrf = sec.new_token(), sec.new_token()
+    _store(request).create_session(sec.token_hash(token), creds.username, csrf, ip, sec.SESSION_TTL)
+    logger.info("Admin login ok", extra={"request_info": {"event": "admin_login_ok", "ip": ip}})
+    resp = JSONResponse({"ok": True, "username": creds.username, "csrf": csrf})
+    resp.set_cookie(sec.SESSION_COOKIE, token, max_age=sec.SESSION_TTL, path="/", secure=True,
+                    httponly=True, samesite="strict")
+    return resp
+
+
+@router.post("/logout")
+async def logout(request: Request, sess: dict = Depends(require_session)):
+    _store(request).delete_session(sess["id_hash"])
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(sec.SESSION_COOKIE, path="/", secure=True, httponly=True, samesite="strict")
+    return resp
+
+
+@router.get("/session")
+async def session(request: Request):
+    sess = sec.get_session(request)
+    if not sess:
+        return {"authenticated": False}
+    return {"authenticated": True, "username": sess["username"], "csrf": sess["csrf"],
+            "expires_at": sess["expires_at"]}
+
+
+# ---------------- accounts ----------------
+class AccountIn(BaseModel):
+    token_v2: str = Field(min_length=10, max_length=4000)
+    space_id: str = Field(min_length=1, max_length=100)
+    user_id: str = Field(min_length=1, max_length=100)
+    label: str = Field(default="", max_length=200)
+    user_email: str = Field(default="", max_length=200)
+    user_name: str = Field(default="", max_length=200)
+    space_view_id: str = Field(default="", max_length=100)
+
+
+class AccountPatch(BaseModel):
+    label: Optional[str] = Field(default=None, max_length=200)
+    enabled: Optional[bool] = None
+    token_v2: Optional[str] = Field(default=None, min_length=10, max_length=4000)
+    user_email: Optional[str] = Field(default=None, max_length=200)
+
+
+@router.get("/accounts")
+async def list_accounts(request: Request, _: dict = Depends(require_session)):
+    cooling = request.app.state.account_pool.cooling_map()
+    items = _store(request).list_accounts()
+    for a in items:
+        a["in_pool"] = a["id"] in cooling
+        a["cooling_seconds"] = cooling.get(a["id"], 0)
+    return {"items": items}
+
+
+@router.post("/accounts")
+async def add_account(request: Request, body: AccountIn, _: dict = Depends(require_session)):
+    try:
+        acc_id = _store(request).add_account(body.model_dump(), label=body.label or body.user_email)
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, "account with this space_id/user_id already exists")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    _reload_pool(request)
+    return {"ok": True, "id": acc_id}
+
+
+@router.patch("/accounts/{acc_id}")
+async def patch_account(acc_id: int, request: Request, body: AccountPatch, _: dict = Depends(require_session)):
+    if not _store(request).update_account(acc_id, label=body.label, enabled=body.enabled,
+                                          token_v2=body.token_v2, user_email=body.user_email):
+        raise HTTPException(404, "account not found or nothing to update")
+    _reload_pool(request)
+    return {"ok": True}
+
+
+@router.delete("/accounts/{acc_id}")
+async def delete_account(acc_id: int, request: Request, _: dict = Depends(require_session)):
+    if not _store(request).delete_account(acc_id):
+        raise HTTPException(404, "account not found")
+    _reload_pool(request)
+    return {"ok": True}
+
+
+def _rate_limit(kind: str, acc_id: int, interval: int) -> int:
+    now = time.time()
+    with _last_call_lock:
+        last = _last_call.get((kind, acc_id), 0)
+        if now - last < interval:
+            return int(interval - (now - last)) + 1
+        _last_call[(kind, acc_id)] = now
+    return 0
+
+
+def _client_for(request: Request, acc_id: int):
+    from app.notion_client import NotionOpusAPI
+    for c in request.app.state.account_pool.clients:
+        if getattr(c, "admin_id", None) == acc_id:
+            return c
+    cfg = _store(request).get_account_config(acc_id)
+    if not cfg:
+        raise HTTPException(404, "account not found")
+    return NotionOpusAPI(cfg)
+
+
+@router.post("/accounts/{acc_id}/test")
+async def test_account(acc_id: int, request: Request, _: dict = Depends(require_session)):
+    wait = _rate_limit("test", acc_id, TEST_MIN_INTERVAL)
+    if wait:
+        return JSONResponse({"error": "rate limited", "retry_after": wait}, status_code=429)
+    client = _client_for(request, acc_id)
+    try:
+        status, body = await asyncio.to_thread(client.api_post, "getAvailableModels", {"spaceId": client.space_id})
+        models = body.get("models") if isinstance(body, dict) else None
+        ok = status == 200 and isinstance(body, dict)
+        msg = f"HTTP {status}" + (f", {len(models)} models" if isinstance(models, list) else "")
+    except Exception as exc:
+        ok, msg = False, f"{type(exc).__name__}"
+    _store(request).set_test_result(acc_id, ok, msg)
+    return {"ok": ok, "message": msg}
+
+
+def _pick_credits(body: Any) -> dict:
+    if not isinstance(body, dict):
+        return {}
+    keep = {}
+    for k in ("basicCredits", "premiumCredits", "usage", "isEligible", "type", "limitType"):
+        if k in body:
+            keep[k] = body[k]
+    return keep or {"raw_keys": sorted(body.keys())[:30]}
+
+
+@router.post("/accounts/{acc_id}/credits")
+async def account_credits(acc_id: int, request: Request, _: dict = Depends(require_session)):
+    wait = _rate_limit("credits", acc_id, CREDITS_MIN_INTERVAL)
+    if wait:
+        return JSONResponse({"error": "rate limited", "retry_after": wait}, status_code=429)
+    client = _client_for(request, acc_id)
+    try:
+        status, body = await asyncio.to_thread(client.api_post, "getAIUsageEligibilityV2", {"spaceId": client.space_id})
+    except Exception as exc:
+        raise HTTPException(502, f"Notion request failed: {type(exc).__name__}")
+    if status != 200:
+        raise HTTPException(502, f"Notion returned HTTP {status}")
+    credits = _pick_credits(body)
+    _store(request).set_credits(acc_id, credits)
+    return {"ok": True, "credits": credits}
+
+
+# ---------------- overview / logs / stats ----------------
+@router.get("/overview")
+async def overview(request: Request, _: dict = Depends(require_session)):
+    st = _store(request)
+    pool = request.app.state.account_pool
+    accs = st.list_accounts()
+    s1 = st.stats(days=1)
+    s7 = st.stats(days=7)
+    return {
+        "accounts": {"total": len(accs), "enabled": sum(1 for a in accs if a["enabled"]), **pool.get_status_summary()},
+        "last_24h": s1["totals"],
+        "last_7d": s7["totals"],
+        "by_day": s7["by_day"],
+        "recent_errors": st.list_requests(limit=10, status="error")["items"],
+        "uptime": int(time.time() - request.app.state.start_time),
+        "mode": getattr(request.app.state, "mode", ""),
+    }
+
+
+@router.get("/requests")
+async def requests_log(request: Request, limit: int = 50, offset: int = 0, model: str = "", account: str = "",
+                       status: str = "", _: dict = Depends(require_session)):
+    limit = max(1, min(limit, 200))
+    return _store(request).list_requests(limit=limit, offset=max(0, offset), model=model, account=account,
+                                         status=status)
+
+
+@router.get("/stats")
+async def stats(request: Request, days: int = 7, _: dict = Depends(require_session)):
+    return _store(request).stats(days=max(1, min(days, 30)))

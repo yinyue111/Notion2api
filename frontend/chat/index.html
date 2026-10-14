@@ -1,0 +1,1757 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Notion AI Studio</title>
+<script>
+/* Admin-session shim: /v1 calls from the playground use the admin session (cookie + CSRF) when no API key is set. */
+(function(){
+  const of=window.fetch.bind(window);let csrf=null;
+  const ready=of('/admin/api/session',{credentials:'same-origin',cache:'no-store'}).then(r=>r.json()).then(j=>{if(!j.authenticated){window.top.location.href='/#login';}csrf=j.csrf||null;}).catch(()=>{});
+  window.fetch=async function(input,init){
+    init=init||{};const url=typeof input==='string'?input:(input&&input.url)||'';
+    let u;try{u=new URL(url,location.href);}catch(e){return of(input,init);}
+    if(u.origin===location.origin&&u.pathname.startsWith('/v1')){
+      await ready;const h=new Headers(init.headers||{});
+      if(!(h.get('Authorization')||'').replace(/^Bearer\s*/i,'').trim())h.delete('Authorization');
+      if(csrf)h.set('X-CSRF-Token',csrf);
+      init=Object.assign({},init,{headers:h,credentials:'same-origin'});
+    }
+    return of(input,init);
+  };
+})();
+</script>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" id="hljs-light">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" id="hljs-dark" disabled>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<style>
+/* ===== RESET & BASE ===== */
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden}
+body{
+  font-family:-apple-system,"SF Pro Text","Helvetica Neue",sans-serif;
+  font-size:14px;color:#111;background:#fff;
+  display:flex;
+}
+.hidden{display:none!important}
+button{cursor:pointer;font-family:inherit;border:none;background:none;color:inherit}
+input,textarea{font-family:inherit;color:#111}
+a{color:inherit;text-decoration:none}
+
+/* ===== DARK THEME ===== */
+[data-theme="dark"]{
+  --bg:#1a1a1a;--bg-secondary:#222;--bg-hover:#2a2a2a;--bg-sidebar:#1e1e1e;
+  --text:#e5e5e5;--text-secondary:#999;--text-tertiary:#666;
+  --border:#333;--border-hover:#555;--border-active:#e5e5e5;
+  --input-bg:#222;--card-bg:#1e1e1e;
+  --user-bubble-bg:#2a2a2a;--thinking-bg:#1e1e1e;
+  --send-bg:#e5e5e5;--send-color:#111;--send-hover:#ccc;
+}
+[data-theme="light"]{
+  --bg:#fff;--bg-secondary:#fafafa;--bg-hover:#f0f0f0;--bg-sidebar:#fafafa;
+  --text:#111;--text-secondary:#888;--text-tertiary:#aaa;
+  --border:#e8e8e8;--border-hover:#bbb;--border-active:#000;
+  --input-bg:#fff;--card-bg:#fff;
+  --user-bubble-bg:#f5f5f5;--thinking-bg:#fafafa;
+  --send-bg:#000;--send-color:#fff;--send-hover:#333;
+}
+body{background:var(--bg);color:var(--text)}
+
+/* ===== SIDEBAR ===== */
+.sidebar{
+  width:220px;min-width:160px;max-width:400px;height:100vh;
+  background:var(--bg-sidebar);
+  border-right:1px solid var(--border);
+  display:flex;flex-direction:column;
+  transition:transform .2s;
+  z-index:100;
+  position:relative;
+}
+.sidebar-resize-handle{
+  position:absolute;top:0;right:-3px;width:6px;height:100%;
+  cursor:col-resize;z-index:101;
+}
+.sidebar-resize-handle:hover,.sidebar-resize-handle.active{
+  background:var(--border-active);opacity:.3;
+}
+.sidebar-top{
+  height:48px;display:flex;align-items:center;
+  padding:0 12px;gap:8px;flex-shrink:0;
+}
+.search-box{
+  flex:1;display:flex;align-items:center;gap:6px;
+  padding:0 8px;height:30px;border-radius:6px;
+  border:1px solid var(--border);background:var(--bg);
+  font-size:13px;color:var(--text-secondary);cursor:text;
+  transition:border-color .1s;
+}
+.search-box:hover{border-color:var(--border-hover)}
+.search-box svg{flex-shrink:0;opacity:.5}
+.search-box input{
+  border:none;background:none;outline:none;
+  font-size:13px;color:var(--text);width:100%;
+}
+.search-box input::placeholder{color:#bbb}
+.new-chat-btn{
+  width:28px;height:28px;display:flex;align-items:center;justify-content:center;
+  flex-shrink:0;color:var(--text-secondary);
+  transition:color .1s;border-radius:4px;
+}
+.new-chat-btn:hover{color:var(--text)}
+
+/* Chat list */
+.chat-list{flex:1;overflow-y:auto;padding:4px 0}
+.chat-list::-webkit-scrollbar{width:4px}
+.chat-list::-webkit-scrollbar-thumb{background:#ddd;border-radius:2px}
+[data-theme="dark"] .chat-list::-webkit-scrollbar-thumb{background:#444}
+
+.chat-section-header{
+  font-size:11px;text-transform:uppercase;color:var(--text-tertiary);
+  letter-spacing:.08em;padding:12px 16px 4px;font-weight:500;
+}
+.chat-item{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:6px 12px 6px 14px;cursor:pointer;
+  font-size:13px;color:var(--text-secondary);
+  border-left:2px solid transparent;
+  transition:background .1s;
+}
+.chat-item:hover{background:var(--bg-hover)}
+.chat-item.active{
+  font-weight:500;color:var(--text);
+  border-left-color:var(--border-active);
+  background:var(--bg-hover);
+}
+.chat-item-title{
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;
+}
+.chat-item-menu-btn{
+  opacity:0;width:24px;height:24px;display:flex;align-items:center;justify-content:center;
+  border-radius:4px;color:var(--text-secondary);transition:opacity .1s;flex-shrink:0;
+}
+.chat-item:hover .chat-item-menu-btn{opacity:1}
+.chat-item-menu-btn:hover{background:var(--border)}
+
+/* Dropdown */
+.chat-dropdown-container{position:relative;display:flex;align-items:center}
+.custom-dropdown{
+  display:none;position:absolute;right:0;top:100%;
+  background:var(--card-bg);border:1px solid var(--border);
+  border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.08);
+  min-width:120px;z-index:200;padding:4px;
+}
+.custom-dropdown.open{display:block}
+.dropdown-item{
+  display:block;width:100%;text-align:left;padding:6px 10px;
+  font-size:12px;border-radius:4px;transition:background .1s;
+}
+.dropdown-item:hover{background:var(--bg-hover)}
+.dropdown-item.danger{color:#d00}
+.dropdown-divider{height:1px;background:var(--border);margin:4px 0}
+
+/* Sidebar footer */
+.sidebar-footer{
+  padding:8px 12px;border-top:1px solid var(--border);
+  display:flex;flex-direction:column;gap:2px;flex-shrink:0;
+}
+.sidebar-footer-btn{
+  display:flex;align-items:center;gap:8px;
+  padding:6px 8px;font-size:12px;color:var(--text-secondary);
+  border-radius:4px;transition:background .1s;
+}
+.sidebar-footer-btn:hover{background:var(--bg-hover);color:var(--text)}
+
+/* ===== MAIN AREA ===== */
+.main-area{flex:1;display:flex;flex-direction:column;height:100vh;overflow:hidden}
+
+/* Header */
+.main-header{
+  height:48px;min-height:48px;display:flex;align-items:center;
+  justify-content:space-between;padding:0 16px;
+  border-bottom:1px solid var(--border);background:var(--bg);
+  flex-shrink:0;
+}
+.header-left{display:flex;align-items:center;gap:8px;flex:1;min-width:0}
+.sidebar-toggle-btn{
+  display:none;width:32px;height:32px;
+  align-items:center;justify-content:center;
+  color:var(--text-secondary);border-radius:4px;
+}
+.sidebar-toggle-btn:hover{background:var(--bg-hover)}
+.header-title{
+  font-size:14px;font-weight:500;cursor:pointer;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  padding:4px 8px;border-radius:4px;border:1px solid transparent;
+  transition:border-color .1s;
+}
+.header-title:hover{border-color:var(--border)}
+.header-title-input{
+  font-size:14px;font-weight:500;border:1px solid var(--border-active);
+  border-radius:4px;padding:4px 8px;outline:none;background:var(--bg);
+  color:var(--text);
+}
+.header-right{display:flex;align-items:center;gap:12px}
+.header-right .token-count{font-size:11px;color:var(--text-tertiary)}
+.theme-toggle{
+  width:28px;height:28px;display:flex;align-items:center;justify-content:center;
+  border-radius:4px;color:var(--text-secondary);transition:color .1s;
+}
+.theme-toggle:hover{color:var(--text)}
+
+/* Memory banner */
+.memory-banner{
+  padding:8px 16px;background:#fffbe6;border-bottom:1px solid #f0e68c;
+  font-size:12px;display:flex;align-items:center;gap:8px;
+}
+[data-theme="dark"] .memory-banner{background:#2a2500;border-color:#444}
+.memory-banner-close{font-size:14px;margin-left:auto;opacity:.6}
+.memory-banner-close:hover{opacity:1}
+
+/* Chat container */
+.chat-container{
+  flex:1;overflow-y:auto;padding:24px 0;
+  display:flex;flex-direction:column;
+}
+.chat-container::-webkit-scrollbar{width:6px}
+.chat-container::-webkit-scrollbar-thumb{background:#ddd;border-radius:3px}
+[data-theme="dark"] .chat-container::-webkit-scrollbar-thumb{background:#444}
+
+/* Welcome screen */
+.welcome-screen{
+  flex:1;display:flex;align-items:center;justify-content:center;
+  flex-direction:column;gap:8px;
+  padding-bottom:18vh;
+}
+.welcome-title{
+  font-size:36px;font-weight:300;color:var(--text);
+}
+.welcome-subtitle{
+  font-size:13px;color:var(--text-tertiary);margin-bottom:32px;
+}
+.welcome-suggestions{
+  display:flex;flex-direction:column;gap:6px;
+  max-width:420px;width:100%;
+}
+.welcome-suggestion{
+  display:flex;align-items:center;gap:8px;
+  padding:8px 14px;border-radius:8px;
+  font-size:13px;color:var(--text-tertiary);
+  border:1px solid transparent;
+  cursor:pointer;transition:all .15s;
+  text-align:left;line-height:1.4;
+}
+.welcome-suggestion:hover{
+  color:var(--text-secondary);
+  background:var(--bg-secondary);
+  border-color:var(--border);
+}
+.welcome-suggestion svg{flex-shrink:0;opacity:.4}
+.welcome-suggestion:hover svg{opacity:.7}
+</style>
+</head>
+<body>
+<!-- Mobile backdrop -->
+<div id="mobileBackdrop" class="mobile-backdrop hidden" style="position:fixed;inset:0;background:rgba(0,0,0,.3);z-index:99"></div>
+
+<!-- SIDEBAR -->
+<aside id="sidebar" class="sidebar">
+  <div class="sidebar-resize-handle" id="sidebarResizeHandle"></div>
+  <div class="sidebar-top">
+    <div class="search-box">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+      <input type="text" id="searchInput" placeholder="Search...">
+    </div>
+    <button id="newChatBtn" class="new-chat-btn" title="New chat">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+    </button>
+  </div>
+  <div id="chatList" class="chat-list"></div>
+  <div class="sidebar-footer">
+    <button id="settingsBtn" class="sidebar-footer-btn">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      Settings
+    </button>
+  </div>
+</aside>
+
+<!-- MAIN -->
+<main class="main-area">
+  <header class="main-header">
+    <div class="header-left">
+      <button id="openSidebarBtn" class="sidebar-toggle-btn">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <span id="headerTitle" class="header-title hidden">New chat</span>
+    </div>
+    <div class="header-right">
+      <span id="tokenCount" class="token-count"></span>
+      <button id="themeToggleBtn" class="theme-toggle" title="Toggle theme">
+        <svg id="sunIcon" class="hidden" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+        <svg id="moonIcon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <div id="memoryBanner" class="memory-banner hidden">
+    <span>Context memory is limited. Some history may not be accessible.</span>
+    <button id="memoryBannerClose" class="memory-banner-close">x</button>
+  </div>
+
+  <div id="chatContainer" class="chat-container"></div>
+
+  <div id="welcomeScreen" class="welcome-screen">
+    <h1 class="welcome-title" id="welcomeGreeting">Good afternoon.</h1>
+    <p class="welcome-subtitle">Select a model and start typing.</p>
+    <div id="welcomeSuggestions" class="welcome-suggestions"></div>
+  </div>
+
+  <!-- Input Area -->
+  <div id="inputAreaWrapper" class="input-area-wrapper">
+    <div class="input-card">
+      <textarea id="chatInput" rows="1" placeholder="Send a message..." class="chat-input"></textarea>
+      <div class="input-toolbar">
+        <div class="toolbar-left">
+          <div class="model-selector-container" id="modelSelectorContainer">
+            <button id="modelTriggerBtn" type="button" class="model-trigger-btn">
+              <span id="modelTriggerProvider" class="model-provider">Anthropic</span>
+              <span class="model-dot"> · </span>
+              <span id="modelTriggerText" class="model-name">Sonnet 4.6</span>
+              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 15l-6-6-6 6"/></svg>
+            </button>
+            <div id="customModelDropdown" class="model-dropdown">
+              <div id="simpleModelList" class="model-list"></div>
+            </div>
+          </div>
+        </div>
+        <div class="toolbar-right">
+          <button id="sendBtn" title="Send (Enter)" class="send-btn">
+            <svg id="sendIcon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+            <svg id="stopIcon" class="hidden" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
+          </button>
+        </div>
+      </div>
+    </div>
+    <div class="input-footer">Shift + Enter for new line</div>
+  </div>
+</main>
+
+<!-- SETTINGS MODAL -->
+<div id="settingsModal" class="modal-overlay hidden">
+  <div class="modal-content">
+    <div class="modal-header">
+      <h3>Settings</h3>
+      <button id="cancelSettingsBtn" class="modal-close-btn">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div class="form-group"><label>Base URL</label><input type="text" id="baseUrlInput" placeholder="http://localhost:8000"></div>
+      <div class="form-group"><label>API Key</label><input type="password" id="apiKeyInput" placeholder="Optional if not set on server"></div>
+    </div>
+    <div class="modal-footer"><button id="saveSettingsBtn" class="btn-primary">Save changes</button></div>
+  </div>
+</div>
+
+<!-- RENAME MODAL -->
+<div id="renameModal" class="modal-overlay hidden">
+  <div class="modal-content modal-sm">
+    <div class="modal-header"><h3>Rename chat</h3></div>
+    <div class="modal-body"><input type="text" id="renameModalInput" placeholder="Enter chat title" class="rename-input"></div>
+    <div class="modal-footer">
+      <button id="cancelRenameBtn" class="btn-secondary">Cancel</button>
+      <button id="saveRenameBtn" class="btn-primary">Save</button>
+    </div>
+  </div>
+</div>
+
+<style>
+/* ===== INPUT AREA ===== */
+.input-area-wrapper{padding:0 16px 12px;flex-shrink:0;max-width:800px;width:100%;margin:0 auto}
+.input-card{
+  border:1px solid var(--border);border-radius:12px;
+  background:var(--card-bg);padding:12px 16px;
+  transition:border-color .15s;
+}
+.input-card:focus-within{border-color:var(--border-hover)}
+.chat-input{
+  width:100%;border:none;background:none;outline:none;resize:none;
+  font-size:14px;line-height:1.5;color:var(--text);
+  min-height:24px;max-height:160px;
+}
+.chat-input::placeholder{color:#bbb}
+.input-toolbar{display:flex;align-items:center;justify-content:space-between;margin-top:8px}
+.toolbar-left{display:flex;align-items:center}
+.toolbar-right{display:flex;align-items:center}
+.input-footer{text-align:center;font-size:11px;color:var(--text-tertiary);margin-top:6px}
+
+/* Model selector */
+.model-trigger-btn{
+  display:flex;align-items:center;gap:0;
+  padding:4px 10px;border:1px solid var(--border);border-radius:6px;
+  background:var(--card-bg);font-size:13px;
+  transition:border-color .1s;height:28px;
+}
+.model-trigger-btn:hover{border-color:var(--border-hover)}
+.model-provider{color:var(--text-tertiary);font-size:12px}
+.model-dot{color:var(--text-tertiary);font-size:12px}
+.model-name{color:var(--text);font-size:13px;font-weight:500}
+.model-trigger-btn svg{margin-left:6px;color:var(--text-tertiary)}
+
+/* Model dropdown - opens UPWARD */
+.model-selector-container{position:relative}
+.model-dropdown{
+  display:none;position:absolute;bottom:calc(100% + 6px);left:0;
+  background:var(--card-bg);border:1px solid var(--border);
+  border-radius:8px;box-shadow:0 -4px 20px rgba(0,0,0,.08);
+  min-width:220px;max-height:360px;overflow-y:auto;
+  z-index:300;padding:4px;
+}
+.model-dropdown.open{display:block}
+.model-group-label{
+  font-size:11px;text-transform:uppercase;color:var(--text-tertiary);
+  letter-spacing:.08em;padding:8px 10px 4px;font-weight:500;
+}
+.model-option{
+  display:flex;align-items:center;justify-content:space-between;
+  width:100%;padding:6px 10px;font-size:13px;
+  border-radius:4px;border-left:2px solid transparent;
+  transition:background .1s;text-align:left;color:var(--text);
+}
+.model-option:hover{background:var(--bg-hover)}
+.model-option.selected{border-left-color:var(--border-active);font-weight:500}
+.model-option-left{display:flex;align-items:center;gap:8px}
+.model-option-badge{
+  font-size:10px;padding:1px 5px;border:1px solid var(--border);
+  border-radius:3px;color:var(--text-tertiary);
+}
+.model-option-provider-badge{
+  width:20px;height:20px;display:flex;align-items:center;justify-content:center;
+  font-size:10px;font-weight:600;border:1px solid var(--border);
+  border-radius:4px;color:var(--text-secondary);flex-shrink:0;
+}
+.model-option-check{display:none}
+.model-option.selected .model-option-check{display:block;color:var(--text)}
+.model-group-divider{height:1px;background:var(--border);margin:4px 0}
+
+/* Send button */
+.send-btn{
+  width:32px;height:32px;border-radius:8px;
+  background:var(--send-bg);color:var(--send-color);
+  display:flex;align-items:center;justify-content:center;
+  transition:background .1s;
+}
+.send-btn:hover{background:var(--send-hover)}
+
+/* ===== MESSAGES ===== */
+.message-row{padding:4px 16px;max-width:800px;width:100%;margin:0 auto}
+.user-message{display:flex;justify-content:flex-end;margin-bottom:16px}
+.user-bubble{
+  background:var(--user-bubble-bg);border-radius:12px;
+  padding:10px 14px;max-width:75%;font-size:14px;line-height:1.6;
+  white-space:pre-wrap;word-break:break-word;
+}
+.assistant-message{margin-bottom:20px}
+.assistant-content{max-width:100%}
+.assistant-meta{
+  display:flex;align-items:center;gap:8px;margin-bottom:4px;
+}
+.assistant-model-name{font-size:11px;color:var(--text-tertiary);text-transform:uppercase;letter-spacing:.03em}
+.message-timestamp{font-size:11px;color:var(--text-tertiary)}
+.message-copy-btn{
+  font-size:11px;color:var(--text-tertiary);opacity:0;
+  transition:opacity .15s;padding:2px 6px;border-radius:3px;
+}
+.assistant-message:hover .message-copy-btn{opacity:1}
+.user-message:hover .message-copy-btn{opacity:1}
+.user-message .message-copy-row{justify-content:flex-end}
+.message-copy-btn:hover{background:var(--bg-hover)}
+.message-copy-row{margin-top:8px;display:flex;justify-content:flex-start}
+
+/* Thinking card */
+.thinking-card{
+  border:1px solid var(--border);border-left:3px solid #ddd;
+  border-radius:6px;background:var(--thinking-bg);
+  margin-bottom:8px;overflow:hidden;
+}
+.thinking-header{
+  display:flex;align-items:center;gap:6px;
+  padding:8px 12px;cursor:pointer;font-size:12px;
+  color:var(--text-secondary);
+}
+.thinking-header-dot{
+  width:6px;height:6px;border-radius:50%;background:var(--text-tertiary);flex-shrink:0;
+}
+.thinking-header-label{font-weight:500}
+.thinking-header-timer{color:var(--text-tertiary);font-size:11px}
+.thinking-header-arrow{
+  margin-left:auto;font-size:10px;transition:transform .15s;color:var(--text-tertiary);
+}
+.thinking-card.expanded .thinking-header-arrow{transform:rotate(90deg)}
+.thinking-body{
+  display:none;padding:0 12px 10px;
+  font-size:13px;color:#666;font-style:italic;line-height:1.6;
+}
+[data-theme="dark"] .thinking-body{color:#999}
+.thinking-card.expanded .thinking-body{display:block}
+
+/* Search card */
+.search-card{
+  border:1px solid var(--border);border-radius:6px;
+  background:var(--thinking-bg);margin-bottom:8px;overflow:hidden;
+}
+.search-header{
+  display:flex;align-items:center;gap:6px;
+  padding:8px 12px;cursor:pointer;font-size:12px;
+  color:var(--text-secondary);
+}
+.search-header svg{flex-shrink:0;opacity:.5}
+.search-header-label{font-weight:500}
+.search-header-arrow{margin-left:auto;font-size:10px;transition:transform .15s;color:var(--text-tertiary)}
+.search-card.expanded .search-header-arrow{transform:rotate(90deg)}
+.search-body{display:none;padding:0 12px 10px;font-size:12px}
+.search-card.expanded .search-body{display:block}
+.search-query-text{color:var(--text-secondary);margin-bottom:6px}
+.search-link{
+  display:block;font-size:12px;color:var(--text);
+  padding:3px 0;text-decoration:underline;text-underline-offset:2px;
+}
+.search-link:hover{color:var(--text-secondary)}
+
+/* Thinking indicator (pre-stream) */
+.thinking-indicator{
+  padding:4px 16px;max-width:800px;width:100%;margin:0 auto;
+}
+.thinking-indicator-inner{
+  font-size:13px;color:var(--text-tertiary);
+  animation:pulse-opacity 1.5s ease-in-out infinite;
+}
+@keyframes pulse-opacity{0%,100%{opacity:.6}50%{opacity:1}}
+
+/* Typing dots */
+.typing-indicator{display:flex;gap:4px;padding:8px 0}
+.typing-indicator span{
+  width:4px;height:4px;border-radius:50%;background:var(--text-tertiary);
+  animation:typing-bounce .6s ease-in-out infinite;
+}
+.typing-indicator span:nth-child(2){animation-delay:.15s}
+.typing-indicator span:nth-child(3){animation-delay:.3s}
+@keyframes typing-bounce{0%,100%{opacity:.3}50%{opacity:1}}
+
+/* Streaming cursor */
+.streaming-cursor::after{
+  content:"|";animation:blink .8s step-end infinite;color:var(--text-tertiary);
+}
+@keyframes blink{50%{opacity:0}}
+
+/* ===== MARKDOWN ===== */
+.markdown-body{font-size:14px;line-height:1.7;word-break:break-word}
+.markdown-body p{margin:0 0 12px}
+.markdown-body p:last-child{margin-bottom:0}
+.markdown-body h1,.markdown-body h2,.markdown-body h3{margin:16px 0 8px;font-weight:600}
+.markdown-body h1{font-size:20px}
+.markdown-body h2{font-size:17px}
+.markdown-body h3{font-size:15px}
+.markdown-body ul,.markdown-body ol{margin:8px 0;padding-left:24px}
+.markdown-body li{margin:4px 0}
+.markdown-body blockquote{
+  border-left:3px solid var(--border);padding:4px 12px;
+  margin:8px 0;color:var(--text-secondary);
+}
+.markdown-body code{
+  font-family:"JetBrains Mono",Menlo,monospace;font-size:13px;
+  background:var(--bg-secondary);padding:2px 5px;border-radius:3px;
+}
+.markdown-body pre{
+  position:relative;background:var(--bg-secondary);
+  border:1px solid var(--border);border-radius:8px;
+  padding:14px;margin:12px 0;overflow-x:auto;
+}
+.markdown-body pre code{background:none;padding:0;font-size:13px;line-height:1.5}
+.markdown-body table{border-collapse:collapse;width:100%;margin:12px 0}
+.markdown-body th,.markdown-body td{
+  border:1px solid var(--border);padding:8px 12px;text-align:left;font-size:13px;
+}
+.markdown-body th{background:var(--bg-secondary);font-weight:600}
+.markdown-body a{color:var(--text);text-decoration:underline;text-underline-offset:2px}
+
+/* Citation badges */
+.cite-badge{
+  display:inline-flex;align-items:center;justify-content:center;
+  width:18px;height:18px;border-radius:9px;
+  background:var(--bg-secondary);border:1px solid var(--border);
+  font-size:10px;font-weight:600;color:var(--text-secondary);
+  cursor:pointer;vertical-align:super;margin:0 1px;
+  position:relative;text-decoration:none;line-height:1;
+  transition:background .1s,border-color .1s;
+}
+.cite-badge:hover{background:var(--bg-hover);border-color:var(--border-hover)}
+.cite-tooltip{
+  display:none;position:absolute;bottom:calc(100% + 6px);left:50%;
+  transform:translateX(-50%);
+  background:var(--card-bg);border:1px solid var(--border);
+  border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.1);
+  padding:8px 12px;min-width:200px;max-width:320px;
+  z-index:400;font-size:12px;font-weight:400;
+  text-align:left;white-space:normal;
+}
+.cite-badge:hover .cite-tooltip{display:block}
+.cite-tooltip-title{font-weight:500;color:var(--text);margin-bottom:2px;line-height:1.4}
+.cite-tooltip-url{color:var(--text-tertiary);font-size:11px;word-break:break-all}
+/* Citation reference list at bottom of message */
+.cite-ref-list{
+  margin-top:12px;padding-top:8px;border-top:1px solid var(--border);
+  font-size:12px;color:var(--text-secondary);
+}
+.cite-ref-item{display:flex;gap:6px;margin-bottom:4px;line-height:1.5}
+.cite-ref-num{
+  flex-shrink:0;width:18px;height:18px;border-radius:9px;
+  background:var(--bg-secondary);border:1px solid var(--border);
+  font-size:10px;font-weight:600;color:var(--text-secondary);
+  display:flex;align-items:center;justify-content:center;
+}
+.cite-ref-link{color:var(--text);text-decoration:underline;text-underline-offset:2px}
+.cite-ref-link:hover{color:var(--text-secondary)}
+.markdown-body hr{border:none;border-top:1px solid var(--border);margin:16px 0}
+.code-copy-btn{
+  position:absolute;top:8px;right:8px;
+  font-size:11px;padding:3px 8px;border-radius:4px;
+  background:var(--bg);border:1px solid var(--border);
+  color:var(--text-secondary);cursor:pointer;
+  opacity:0;transition:opacity .15s;
+}
+pre:hover .code-copy-btn{opacity:1}
+.code-copy-btn:hover{border-color:var(--border-hover)}
+
+/* ===== MODALS ===== */
+.modal-overlay{
+  position:fixed;inset:0;background:rgba(0,0,0,.4);
+  display:flex;align-items:center;justify-content:center;z-index:500;
+}
+.modal-content{
+  background:var(--card-bg);border:1px solid var(--border);
+  border-radius:12px;width:420px;max-width:90vw;
+  box-shadow:0 8px 30px rgba(0,0,0,.12);
+}
+.modal-sm{width:340px}
+.modal-header{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:16px 20px;border-bottom:1px solid var(--border);
+}
+.modal-header h3{font-size:15px;font-weight:600}
+.modal-close-btn{color:var(--text-secondary);padding:4px;border-radius:4px}
+.modal-close-btn:hover{background:var(--bg-hover)}
+.modal-body{padding:16px 20px}
+.form-group{margin-bottom:14px}
+.form-group label{display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px;font-weight:500}
+.form-group input,.rename-input{
+  width:100%;padding:8px 10px;border:1px solid var(--border);
+  border-radius:6px;font-size:13px;background:var(--bg);
+  color:var(--text);outline:none;transition:border-color .1s;
+}
+.form-group input:focus,.rename-input:focus{border-color:var(--border-active)}
+.modal-footer{
+  display:flex;justify-content:flex-end;gap:8px;
+  padding:12px 20px;border-top:1px solid var(--border);
+}
+.btn-primary{
+  padding:7px 16px;border-radius:6px;font-size:13px;font-weight:500;
+  background:var(--send-bg);color:var(--send-color);transition:background .1s;
+}
+.btn-primary:hover{background:var(--send-hover)}
+.btn-secondary{
+  padding:7px 16px;border-radius:6px;font-size:13px;
+  border:1px solid var(--border);color:var(--text-secondary);
+  transition:border-color .1s;
+}
+.btn-secondary:hover{border-color:var(--border-hover)}
+
+/* ===== MOBILE ===== */
+@media(max-width:768px){
+  .sidebar{position:fixed;left:0;top:0;transform:translateX(-100%)}
+  .sidebar.open{transform:translateX(0)}
+  .sidebar-toggle-btn{display:flex}
+  .message-row{padding:4px 12px}
+  .input-area-wrapper{padding:0 8px 8px}
+}
+
+/* ===== FADE IN ===== */
+.fade-in{animation:fadeIn .2s ease}
+@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+
+/* ===== ERROR CARD ===== */
+.error-card{border:1px solid #f5c6cb;border-radius:8px;padding:14px 16px;background:#fff5f5;color:#721c24;font-size:13px;line-height:1.5}
+[data-theme="dark"] .error-card{background:#2d1b1b;border-color:#5a2d2d;color:#f5c6cb}
+.error-card-header{display:flex;align-items:center;gap:8px;margin-bottom:8px;font-weight:600}
+.error-card-icon{font-size:16px;flex-shrink:0}
+.error-card-title{font-size:14px}
+.error-card-code{margin-left:auto;font-size:11px;font-family:monospace;padding:2px 6px;border-radius:4px;background:rgba(114,28,36,.1);color:#a94442}
+[data-theme="dark"] .error-card-code{background:rgba(245,198,203,.1);color:#f5c6cb}
+.error-card-message{margin-bottom:6px}
+.error-card-suggestion{font-size:12px;opacity:.85;margin-top:6px;padding-top:6px;border-top:1px solid rgba(114,28,36,.15)}
+[data-theme="dark"] .error-card-suggestion{border-top-color:rgba(245,198,203,.15)}
+.error-card-details{margin-top:8px;font-size:11px}
+.error-card-details summary{cursor:pointer;opacity:.7;user-select:none}
+.error-card-details pre{margin-top:4px;padding:8px;border-radius:4px;background:rgba(0,0,0,.05);white-space:pre-wrap;word-break:break-all;font-size:11px;max-height:120px;overflow-y:auto}
+[data-theme="dark"] .error-card-details pre{background:rgba(255,255,255,.05)}
+</style>
+
+<script>
+/* ===== NAMESPACE ===== */
+window.NotionAI = window.NotionAI || {};
+window.NotionAI.Core = window.NotionAI.Core || {};
+window.NotionAI.API = window.NotionAI.API || {};
+window.NotionAI.Chat = window.NotionAI.Chat || {};
+window.NotionAI.UI = window.NotionAI.UI || {};
+window.NotionAI.Utils = window.NotionAI.Utils || {};
+
+/* ===== CONSTANTS ===== */
+window.NotionAI.Core.Constants = {
+  STORAGE_KEYS:{API_KEY:'claude_api_key',BASE_URL:'claude_base_url',CHATS:'claude_chats',THEME:'theme'},
+  API:{CHAT_COMPLETIONS:'/v1/chat/completions',DELETE_CONVERSATION:id=>`/v1/conversations/${encodeURIComponent(id)}`},
+  MODEL_GROUPS:[
+    {label:'Anthropic',models:[
+      {id:"claude-sonnet4.6",label:"Sonnet 4.6",provider:"Anthropic",desc:"Fast & efficient"},
+      {id:"claude-sonnet5",label:"Sonnet 5",provider:"Anthropic",badge:"New"},
+      {id:"claude-sonnet5.5",label:"Sonnet 5.5",provider:"Anthropic",badge:"New"},
+      {id:"claude-opus4.6",label:"Opus 4.6",provider:"Anthropic"},
+      {id:"claude-opus4.7",label:"Opus 4.7",provider:"Anthropic"},
+      {id:"claude-opus4.8",label:"Opus 4.8",provider:"Anthropic"},
+      {id:"claude-opus5.5",label:"Opus 5.5",provider:"Anthropic",badge:"New"},
+      {id:"claude-opus5",label:"Opus 5",provider:"Anthropic"},
+      {id:"claude-haiku4.5",label:"Haiku 4.5",provider:"Anthropic"},
+      {id:"claude-haiku5.5",label:"Haiku 5.5",provider:"Anthropic",badge:"New"},
+    ]},
+    {label:'OpenAI',models:[
+      {id:"gpt-6-astra",label:"GPT-6 Astra",provider:"OpenAI",badge:"New"},
+      {id:"gpt-5.6-sol",label:"GPT-5.6 Sol",provider:"OpenAI",badge:"New"},
+      {id:"gpt-6-luna",label:"GPT-6 Luna",provider:"OpenAI",badge:"New"},
+      {id:"gpt-6.1-sol",label:"GPT-6.1 Sol",provider:"OpenAI",badge:"New"},
+      {id:"gpt-5.6-terra",label:"GPT-5.6 Terra",provider:"OpenAI",badge:"New"},
+      {id:"gpt-5.6-luna",label:"GPT-5.6 Luna",provider:"OpenAI",badge:"New"},
+      {id:"gpt-5.4",label:"GPT-5.4",provider:"OpenAI"},
+      {id:"gpt-5.2",label:"GPT-5.2",provider:"OpenAI",badge:"New"},
+      {id:"gpt-5.4-nano",label:"GPT-5.4 Nano",provider:"OpenAI",badge:"New"},
+      {id:"gpt-5.4-mini",label:"GPT-5.4 Mini",provider:"OpenAI",badge:"New"},
+      {id:"gpt-5.5",label:"GPT-5.5",provider:"OpenAI",badge:"Beta"},
+    ]},
+    {label:'Google',models:[
+      {id:"gemini-3.5flash",label:"Gemini 3.5 Flash",provider:"Google",badge:"New"},
+      {id:"gemini-3.6flash",label:"Gemini 3.6 Flash",provider:"Google",badge:"New"},
+      {id:"gemini-3.7flash",label:"Gemini 3.7 Flash",provider:"Google",badge:"New"},
+      {id:"gemini-3.1pro",label:"Gemini 3.1 Pro",provider:"Google"},
+      {id:"gemini-3flash",label:"Gemini 3 Flash",provider:"Google"},
+    ]},
+    {label:'Moonshot',models:[
+      {id:"kimi-2.7",label:"Kimi K3",provider:"Moonshot",badge:"New"},
+      {id:"kimi-k3",label:"Kimi K3",provider:"Moonshot",badge:"New"},
+    ]},
+    {label:'xAI',models:[
+      {id:"grok-4.3",label:"Grok 4.3",provider:"xAI",badge:"New"},
+      {id:"grok-4.6",label:"Grok 4.6",provider:"xAI",badge:"New"},
+      {id:"spacexai-4.5",label:"SpaceXAI 4.5",provider:"xAI",badge:"New"},
+      {id:"grok-build0.1",label:"Grok Build 0.1",provider:"xAI",badge:"New"},
+    ]},
+    {label:'DeepSeek',models:[
+      {id:"deepseek-v4pro",label:"DeepSeek V4 Pro",provider:"DeepSeek",badge:"New"},
+      {id:"deepseek-v4flash",label:"DeepSeek V4 Flash",provider:"DeepSeek",badge:"New"},
+      {id:"deepseek-v4.1flash",label:"DeepSeek V4.1 Flash",provider:"DeepSeek",badge:"New"},
+    ]},
+    {label:'Zhipu',models:[
+      {id:"glm-5.2",label:"GLM 5.2",provider:"Zhipu",badge:"New"},
+      {id:"glm-5.3",label:"GLM 5.3",provider:"Zhipu",badge:"New"},
+      {id:"glm-5.3flash",label:"GLM 5.3 Flash",provider:"Zhipu",badge:"New"},
+    ]},
+    {label:'Notion',models:[
+      {id:"fable-5",label:"Fable 5",provider:"Notion",badge:"New"},
+      {id:"fable-5.1",label:"Fable 5.1",provider:"Notion",badge:"New"},
+    ]}
+  ],
+  MODELS:[
+    {id:"claude-sonnet4.6",label:"Sonnet 4.6"},{id:"claude-sonnet5",label:"Sonnet 5"},{id:"claude-sonnet5.5",label:"Sonnet 5.5"},{id:"claude-opus4.6",label:"Opus 4.6"},
+    {id:"claude-opus4.7",label:"Opus 4.7"},{id:"claude-opus4.8",label:"Opus 4.8"},{id:"claude-opus5",label:"Opus 5"},{id:"claude-opus5.5",label:"Opus 5.5"},{id:"claude-haiku4.5",label:"Haiku 4.5"},{id:"claude-haiku5.5",label:"Haiku 5.5"},
+    {id:"gpt-6-astra",label:"GPT-6 Astra"},
+    {id:"gpt-5.6-sol",label:"GPT-5.6 Sol"},{id:"gpt-6-luna",label:"GPT-6 Luna"},{id:"gpt-6.1-sol",label:"GPT-6.1 Sol"},{id:"gpt-5.6-terra",label:"GPT-5.6 Terra"},{id:"gpt-5.6-luna",label:"GPT-5.6 Luna"},
+    {id:"gpt-5.4",label:"GPT-5.4"},{id:"gpt-5.2",label:"GPT-5.2"},{id:"gpt-5.4-nano",label:"GPT-5.4 Nano"},{id:"gpt-5.4-mini",label:"GPT-5.4 Mini"},{id:"gpt-5.5",label:"GPT-5.5"},
+    {id:"gemini-3.5flash",label:"Gemini 3.5 Flash"},{id:"gemini-3.6flash",label:"Gemini 3.6 Flash"},{id:"gemini-3.7flash",label:"Gemini 3.7 Flash"},{id:"gemini-3.1pro",label:"Gemini 3.1 Pro"},{id:"gemini-3flash",label:"Gemini 3 Flash"},
+    {id:"kimi-2.7",label:"Kimi K3"},{id:"kimi-k3",label:"Kimi K3"},
+    {id:"grok-4.3",label:"Grok 4.3"},{id:"grok-4.6",label:"Grok 4.6"},{id:"spacexai-4.5",label:"SpaceXAI 4.5"},{id:"grok-build0.1",label:"Grok Build 0.1"},
+    {id:"deepseek-v4pro",label:"DeepSeek V4 Pro"},{id:"deepseek-v4flash",label:"DeepSeek V4 Flash"},{id:"deepseek-v4.1flash",label:"DeepSeek V4.1 Flash"},{id:"glm-5.2",label:"GLM 5.2"},{id:"glm-5.3",label:"GLM 5.3"},{id:"glm-5.3flash",label:"GLM 5.3 Flash"},{id:"fable-5",label:"Fable 5"},{id:"fable-5.1",label:"Fable 5.1"},
+  ],
+  DEFAULT_MODEL:"claude-sonnet4.6",
+  MODEL_DISPLAY_NAMES:{
+    "claude-sonnet4.6":"Sonnet 4.6","claude-sonnet5.5":"Sonnet 5.5","claude-sonnet5":"Sonnet 5","claude-opus4.6":"Opus 4.6","claude-opus4.7":"Opus 4.7","claude-opus4.8":"Opus 4.8","claude-opus5":"Opus 5","claude-opus5.5":"Opus 5.5","claude-haiku5.5":"Haiku 5.5","claude-haiku4.5":"Haiku 4.5",
+    "gpt-6-astra":"GPT-6 Astra",
+    "gpt-6.1-sol":"GPT-6.1 Sol","gpt-6-luna":"GPT-6 Luna","gpt-5.6-sol":"GPT-5.6 Sol","gpt-5.6-terra":"GPT-5.6 Terra","gpt-5.6-luna":"GPT-5.6 Luna","gpt-5.4-mini":"GPT-5.4 Mini","gpt-5.4-nano":"GPT-5.4 Nano","gpt-5.2":"GPT-5.2","gpt-5.4":"GPT-5.4","gpt-5.5":"GPT-5.5",
+    "gemini-3.7flash":"Gemini 3.7 Flash","gemini-3.6flash":"Gemini 3.6 Flash","gemini-3.5flash":"Gemini 3.5 Flash","gemini-3.1pro":"Gemini 3.1 Pro","gemini-3flash":"Gemini 3 Flash","kimi-k3":"Kimi K3","kimi-2.7":"Kimi K3",
+    "grok-4.6":"Grok 4.6","grok-4.3":"Grok 4.3","spacexai-4.5":"SpaceXAI 4.5","grok-build0.1":"Grok Build 0.1","deepseek-v4.1flash":"DeepSeek V4.1 Flash","deepseek-v4flash":"DeepSeek V4 Flash","deepseek-v4pro":"DeepSeek V4 Pro","glm-5.3flash":"GLM 5.3 Flash","glm-5.3":"GLM 5.3","glm-5.2":"GLM 5.2","fable-5.1":"Fable 5.1","fable-5":"Fable 5",
+  },
+  MODEL_PROVIDERS:{
+    "claude-sonnet4.6":"Anthropic","claude-sonnet5.5":"Anthropic","claude-sonnet5":"Anthropic","claude-opus4.6":"Anthropic","claude-opus4.7":"Anthropic","claude-opus4.8":"Anthropic","claude-opus5":"Anthropic","claude-opus5.5":"Anthropic","claude-haiku5.5":"Anthropic","claude-haiku4.5":"Anthropic",
+    "gpt-6-astra":"OpenAI",
+    "gpt-6.1-sol":"OpenAI","gpt-6-luna":"OpenAI","gpt-5.6-sol":"OpenAI","gpt-5.6-terra":"OpenAI","gpt-5.6-luna":"OpenAI","gpt-5.4-mini":"OpenAI","gpt-5.4-nano":"OpenAI","gpt-5.2":"OpenAI","gpt-5.4":"OpenAI","gpt-5.5":"OpenAI",
+    "gemini-3.7flash":"Google","gemini-3.6flash":"Google","gemini-3.5flash":"Google","gemini-3.1pro":"Google","gemini-3flash":"Google","kimi-k3":"Moonshot","kimi-2.7":"Moonshot",
+    "grok-4.6":"xAI","grok-4.3":"xAI","spacexai-4.5":"xAI","grok-build0.1":"xAI","deepseek-v4.1flash":"DeepSeek","deepseek-v4flash":"DeepSeek","deepseek-v4pro":"DeepSeek","glm-5.3flash":"Zhipu","glm-5.3":"Zhipu","glm-5.2":"Zhipu","fable-5.1":"Notion","fable-5":"Notion",
+  },
+  CLIENT_TYPE:'Web'
+};
+
+/* ===== STATE ===== */
+window.NotionAI.Core.State = {
+  _state:{
+    baseUrl:localStorage.getItem('claude_base_url')||window.location.origin,
+    apiKey:'',theme:localStorage.getItem('theme')||(window.matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'),
+    chats:JSON.parse(localStorage.getItem('claude_chats'))||[],
+    currentChatId:null,isGenerating:false,controller:null,modelDisplayNames:{},chatToRename:null
+  },
+  loadStoredApiKey(){return localStorage.getItem('claude_api_key')||sessionStorage.getItem('claude_api_key')||''},
+  persistApiKey(k){if(k){localStorage.setItem('claude_api_key',k);sessionStorage.setItem('claude_api_key',k)}else{localStorage.removeItem('claude_api_key');sessionStorage.removeItem('claude_api_key')}},
+  get(k){return this._state[k]},
+  set(k,v){this._state[k]=v},
+  getState(){return this._state}
+};
+window.NotionAI.Core.State._state.apiKey=window.NotionAI.Core.State.loadStoredApiKey();
+const STATE=window.NotionAI.Core.State.getState();
+
+/* ===== VALIDATION ===== */
+window.NotionAI.Utils.Validation = {
+  sanitizeChats(chats){
+    if(!Array.isArray(chats))return[];
+    return chats.map(chat=>{
+      const messages=Array.isArray(chat?.messages)?chat.messages.map(msg=>{
+        if(!msg||typeof msg!=='object')return null;
+        if(msg.role!=='user'&&msg.role!=='assistant')return null;
+        const content=typeof msg.content==='string'?msg.content:'';
+        if(msg.role==='user'){if(!content.trim())return null;return{role:'user',content}}
+        return{role:'assistant',content,thinking:typeof msg.thinking==='string'?msg.thinking:'',
+          search:this.normalizeSearchPayload(msg.search),
+          modelDisplayName:typeof msg.modelDisplayName==='string'?msg.modelDisplayName:null};
+      }).filter(Boolean):[];
+      return{...chat,messages};
+    }).filter(c=>c&&typeof c.id!=='undefined');
+  },
+  normalizeSearchPayload(p){
+    const n={queries:[],sources:[]};if(!p||typeof p!=='object')return n;
+    if(Array.isArray(p.queries))p.queries.forEach(q=>{if(typeof q==='string'&&q.trim())n.queries.push(q.trim())});
+    const sc=[];if(Array.isArray(p.sources))sc.push(...p.sources);if(Array.isArray(p.citations))sc.push(...p.citations);
+    sc.forEach(src=>{
+      if(typeof src==='string'&&src.trim()){n.sources.push({title:src.trim(),url:src.trim(),snippet:''});return}
+      if(!src||typeof src!=='object')return;
+      const title=String(src.title||src.name||src.sourceTitle||src.url||src.href||'').trim();
+      const url=String(src.url||src.href||src.link||'').trim();
+      const snippet=String(src.snippet||src.summary||src.description||'').trim();
+      if(!title&&!url)return;n.sources.push({title:title||url,url,snippet});
+    });return n;
+  }
+};
+
+/* ===== MARKDOWN ===== */
+window.NotionAI.Utils.Markdown = {
+  _cleanFootnotes(md){
+    if(!md)return md;
+    let c=md.replace(/\[\^(\d+)\]/g,'');
+    c=c.replace(/^\[\^\d+\]:\s*.*$/gm,'');
+    c=c.replace(/\n{3,}/g,'\n\n');
+    return c.trim();
+  },
+  renderToSafeHtml(md){return DOMPurify.sanitize(marked.parse(this._cleanFootnotes(md||'')),{USE_PROFILES:{html:true},ADD_ATTR:['target','rel']})},
+  setSafeMarkdown(el,md){
+    el.innerHTML=this.renderToSafeHtml(md);
+    this._processCitations(el);
+  },
+  _processCitations(container){
+    // Collect all external links (skip anchors, code blocks, etc.)
+    const links=Array.from(container.querySelectorAll('a[href]'));
+    const externalLinks=links.filter(a=>{
+      const href=a.getAttribute('href')||'';
+      if(!href.startsWith('http'))return false;
+      // Skip links inside code blocks
+      if(a.closest('pre')||a.closest('code'))return false;
+      return true;
+    });
+    if(!externalLinks.length)return;
+    // Dedupe by URL, assign citation numbers
+    const urlMap=new Map(); // url -> {num, title, url}
+    let counter=0;
+    externalLinks.forEach(a=>{
+      const url=a.getAttribute('href');
+      const title=a.textContent.trim()||url;
+      if(!urlMap.has(url)){
+        counter++;
+        urlMap.set(url,{num:counter,title,url});
+      }
+    });
+    // Replace each link with inline citation badge
+    externalLinks.forEach(a=>{
+      const url=a.getAttribute('href');
+      const info=urlMap.get(url);
+      if(!info)return;
+      const badge=document.createElement('a');
+      badge.className='cite-badge';
+      badge.href=url;
+      badge.target='_blank';
+      badge.rel='noopener noreferrer';
+      badge.textContent=info.num;
+      // Tooltip
+      const tip=document.createElement('span');
+      tip.className='cite-tooltip';
+      const tipTitle=document.createElement('div');
+      tipTitle.className='cite-tooltip-title';
+      tipTitle.textContent=info.title;
+      tip.appendChild(tipTitle);
+      const tipUrl=document.createElement('div');
+      tipUrl.className='cite-tooltip-url';
+      tipUrl.textContent=url.length>60?url.substring(0,60)+'...':url;
+      tip.appendChild(tipUrl);
+      badge.appendChild(tip);
+      a.replaceWith(badge);
+    });
+    // Append reference list at bottom
+    if(urlMap.size>0){
+      const refList=document.createElement('div');
+      refList.className='cite-ref-list';
+      urlMap.forEach(info=>{
+        const item=document.createElement('div');
+        item.className='cite-ref-item';
+        const num=document.createElement('span');
+        num.className='cite-ref-num';
+        num.textContent=info.num;
+        const link=document.createElement('a');
+        link.className='cite-ref-link';
+        link.href=info.url;
+        link.target='_blank';
+        link.rel='noopener noreferrer';
+        link.textContent=info.title;
+        item.appendChild(num);
+        item.appendChild(link);
+        refList.appendChild(item);
+      });
+      container.appendChild(refList);
+    }
+  }
+};
+
+/* ===== DOM UTILS ===== */
+window.NotionAI.Utils.DOM = {
+  copyText(btn,text){navigator.clipboard.writeText(text).then(()=>{const o=btn.innerHTML;btn.innerHTML='<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>';setTimeout(()=>btn.innerHTML=o,2000)})},
+  addCodeBlockCopyButtons(container){
+    container.querySelectorAll('pre').forEach(pre=>{
+      if(pre.querySelector('.code-copy-btn'))return;
+      const code=pre.querySelector('code');if(!code)return;
+      const btn=document.createElement('button');btn.className='code-copy-btn';btn.textContent='Copy';
+      btn.onclick=()=>{this.copyText(btn,code.innerText);btn.textContent='Copied!';setTimeout(()=>btn.textContent='Copy',2000)};
+      pre.appendChild(btn);
+    });
+  },
+  scrollToBottom(){const c=document.getElementById('chatContainer');if(c)c.scrollTo({top:c.scrollHeight,behavior:'smooth'})}
+};
+</script>
+
+<script>
+/* ===== API CLIENT ===== */
+window.NotionAI.API.Client = {
+  async post(endpoint,data,options={}){
+    const r=await fetch(`${window.NotionAI.Core.State.get('baseUrl')}${endpoint}`,{
+      method:'POST',headers:{'Content-Type':'application/json','Authorization':`Bearer ${window.NotionAI.Core.State.get('apiKey')}`,'X-Client-Type':window.NotionAI.Core.Constants.CLIENT_TYPE,...options.headers},
+      body:JSON.stringify(data),...options});return r;
+  },
+  async delete(endpoint){
+    return fetch(`${window.NotionAI.Core.State.get('baseUrl')}${endpoint}`,{
+      method:'DELETE',headers:{'Authorization':`Bearer ${window.NotionAI.Core.State.get('apiKey')}`,'X-Client-Type':window.NotionAI.Core.Constants.CLIENT_TYPE}});
+  },
+  checkMemoryStatus(r){return(r.headers.get('X-Memory-Status')||'').toLowerCase()==='degraded'},
+  getConversationId(r){return(r.headers.get('X-Conversation-Id')||'').trim()},
+  async deleteConversation(id){try{const r=await this.delete(window.NotionAI.Core.Constants.API.DELETE_CONVERSATION(id));if(!r.ok&&r.status!==404)return false;return true}catch(e){return false}}
+};
+
+/* ===== MODELS ===== */
+window.NotionAI.API.Models = {
+  _currentModel:window.NotionAI.Core.Constants.DEFAULT_MODEL,_currentModelLabel:null,
+  getCurrentModel(){return this._currentModel},
+  getCurrentModelLabel(){if(!this._currentModelLabel)this._currentModelLabel=this.getModelDisplayName(this._currentModel);return this._currentModelLabel},
+  setCurrentModel(id,label){this._currentModel=id;this._currentModelLabel=label},
+  getModelDisplayName(id){const n=window.NotionAI.Core.State.get('modelDisplayNames');return n[id]||id},
+  getModelProvider(id){return window.NotionAI.Core.Constants.MODEL_PROVIDERS[id]||''},
+  loadModels(){window.NotionAI.Core.State.set('modelDisplayNames',{...window.NotionAI.Core.Constants.MODEL_DISPLAY_NAMES})},
+  getAvailableModels(){return window.NotionAI.Core.Constants.MODELS}
+};
+
+/* ===== SETTINGS ===== */
+window.NotionAI.API.Settings = {
+  open(){document.getElementById('baseUrlInput').value=window.NotionAI.Core.State.get('baseUrl');document.getElementById('apiKeyInput').value=window.NotionAI.Core.State.get('apiKey');document.getElementById('settingsModal').classList.remove('hidden')},
+  close(){document.getElementById('settingsModal').classList.add('hidden')},
+  save(){const b=document.getElementById('baseUrlInput').value.trim().replace(/\/$/,"");const k=document.getElementById('apiKeyInput').value.trim();window.NotionAI.Core.State.set('baseUrl',b);window.NotionAI.Core.State.set('apiKey',k);localStorage.setItem('claude_base_url',b);window.NotionAI.Core.State.persistApiKey(k);this.close();window.NotionAI.API.Models.loadModels()}
+};
+
+/* ===== STORAGE ===== */
+window.NotionAI.Chat.Storage = {
+  saveChats(){localStorage.setItem('claude_chats',JSON.stringify(window.NotionAI.Core.State.get('chats')))},
+  loadChats(){const c=JSON.parse(localStorage.getItem('claude_chats'))||[];const s=window.NotionAI.Utils.Validation.sanitizeChats(c);window.NotionAI.Core.State.set('chats',s);return s},
+  addMessage(msg){const chats=window.NotionAI.Core.State.get('chats');const chat=chats.find(c=>c.id===window.NotionAI.Core.State.get('currentChatId'));if(chat){chat.messages.push(msg);this.saveChats()}},
+  updateConversationId(chatId,convId){const chats=window.NotionAI.Core.State.get('chats');const chat=chats.find(c=>c.id===chatId);if(chat){chat.conversationId=convId;this.saveChats()}},
+  deleteChat(chatId){let chats=window.NotionAI.Core.State.get('chats');chats=chats.filter(c=>c.id!==chatId);window.NotionAI.Core.State.set('chats',chats);this.saveChats()},
+  updateChatTitle(chatId,title){const chats=window.NotionAI.Core.State.get('chats');const chat=chats.find(c=>c.id===chatId);if(chat){chat.title=title;this.saveChats()}},
+  toggleStar(chatId){const chats=window.NotionAI.Core.State.get('chats');const chat=chats.find(c=>c.id===chatId);if(chat){chat.starred=!chat.starred;this.saveChats()}}
+};
+</script>
+
+<script>
+/* ===== RENDERER ===== */
+window.NotionAI.Chat.Renderer = {
+  createMessageElement(role, modelDisplayName) {
+    const wrapper = document.createElement('div');
+    wrapper.className = `message-row ${role==='user'?'user-message':'assistant-message'} fade-in`;
+    if (role === 'user') {
+      const bubble = document.createElement('div');
+      bubble.className = 'user-bubble';
+      wrapper.appendChild(bubble);
+      const userCopyRow = document.createElement('div');
+      userCopyRow.className = 'message-copy-row';
+      const userCopyBtn = document.createElement('button');
+      userCopyBtn.className = 'message-copy-btn';
+      userCopyBtn.textContent = 'Copy';
+      userCopyBtn.onclick = () => {
+        navigator.clipboard.writeText(bubble.innerText).then(() => { userCopyBtn.textContent='Copied!'; setTimeout(()=>userCopyBtn.textContent='Copy',2000) });
+      };
+      userCopyRow.appendChild(userCopyBtn);
+      wrapper.appendChild(userCopyRow);
+      return { wrapper, bubble };
+    }
+    const content = document.createElement('div');
+    content.className = 'assistant-content';
+    const meta = document.createElement('div');
+    meta.className = 'assistant-meta';
+    const ml = document.createElement('span');
+    ml.className = 'assistant-model-name';
+    ml.textContent = modelDisplayName || 'Assistant';
+    meta.appendChild(ml);
+    const ts = document.createElement('span');
+    ts.className = 'message-timestamp';
+    const now = new Date();
+    ts.textContent = now.getHours().toString().padStart(2,'0') + ':' + now.getMinutes().toString().padStart(2,'0');
+    meta.appendChild(ts);
+    const cb = document.createElement('button');
+    cb.className = 'message-copy-btn';
+    cb.textContent = 'Copy';
+    cb.onclick = () => {
+      const md = wrapper.mdDivRef;
+      if (md) navigator.clipboard.writeText(md.innerText).then(() => { cb.textContent='Copied!'; setTimeout(()=>cb.textContent='Copy',2000) });
+    };
+    // Copy button is now at bottom of message, not in meta
+    content.appendChild(meta);
+    wrapper.appendChild(content);
+    return { wrapper, bubble: content };
+  },
+
+  updateAIMessage(wrapper, content, isFinished) {
+    const mdDiv = wrapper.mdDivRef;
+    if (!content && !isFinished) {
+      mdDiv.innerHTML = '<div class="typing-indicator"><span></span><span></span><span></span></div>';
+      return;
+    }
+    mdDiv.classList.remove('streaming-cursor');
+    window.NotionAI.Utils.Markdown.setSafeMarkdown(mdDiv, content);
+    if (isFinished) {
+      mdDiv.classList.remove('streaming-cursor');
+      mdDiv.querySelectorAll('pre code').forEach(b => { if(!b.dataset.highlighted) hljs.highlightElement(b) });
+      window.NotionAI.Utils.DOM.addCodeBlockCopyButtons(mdDiv);
+      if (wrapper._thinkingTimerInterval) { clearInterval(wrapper._thinkingTimerInterval); wrapper._thinkingTimerInterval = null }
+    } else {
+      mdDiv.classList.add('streaming-cursor');
+    }
+    const cc = document.getElementById('chatContainer');
+    if (cc.scrollHeight - cc.scrollTop < cc.clientHeight + 120) window.NotionAI.Utils.DOM.scrollToBottom();
+  },
+
+  updateThinkingPanel(wrapper) {
+    const card = wrapper.thinkingCardRef;
+    if (!card) return;
+    const raw = String(wrapper.thinkingText || '');
+    if (!raw.trim()) { card.classList.add('hidden'); return }
+    card.classList.remove('hidden');
+    const timer = card.querySelector('.thinking-header-timer');
+    if (timer && wrapper._thinkingStartTime) {
+      timer.textContent = Math.round((Date.now() - wrapper._thinkingStartTime) / 1000) + 's';
+    }
+    if (wrapper.thinkingExpanded) {
+      card.classList.add('expanded');
+      window.NotionAI.Utils.Markdown.setSafeMarkdown(wrapper.thinkingBodyRef, raw);
+    } else {
+      card.classList.remove('expanded');
+    }
+  },
+
+  updateSearchPanel(wrapper) {
+    const card = wrapper.searchCardRef;
+    if (!card) return;
+    const queries = wrapper.searchData?.queries || [];
+    const sources = wrapper.searchData?.sources || [];
+    if (!queries.length && !sources.length) { card.classList.add('hidden'); return }
+    card.classList.remove('hidden');
+    const count = sources.length || queries.length;
+    const hl = card.querySelector('.search-header-label');
+    if (hl) hl.textContent = `Searched ${count} source${count!==1?'s':''}`;
+    const qt = card.querySelector('.search-query-text');
+    if (qt) qt.textContent = queries.length ? `Queries: ${queries.map(q=>`"${q}"`).join(', ')}` : 'Web search executed';
+    const lc = card.querySelector('.search-links-container');
+    if (lc) {
+      lc.innerHTML = '';
+      if (!sources.length) { lc.innerHTML = '<div style="color:var(--text-tertiary)">No sources.</div>' }
+      else sources.forEach(src => {
+        if (src.url) { const a=document.createElement('a');a.className='search-link';a.href=src.url;a.target='_blank';a.rel='noopener noreferrer';a.textContent=src.title||src.url;lc.appendChild(a) }
+        else { const d=document.createElement('div');d.textContent=src.title;d.style.fontSize='12px';lc.appendChild(d) }
+      });
+    }
+    if (wrapper.searchExpanded) card.classList.add('expanded'); else card.classList.remove('expanded');
+  },
+
+  appendMessage(role, content, isFinished, modelDisplayName) {
+    const name = (modelDisplayName || window.NotionAI.API.Models.getModelDisplayName(window.NotionAI.API.Models.getCurrentModel())).trim() || 'Assistant';
+    const { wrapper, bubble } = this.createMessageElement(role, name);
+    if (role === 'user') { bubble.textContent = content }
+    else {
+      const refs = this._buildAssistantContent(bubble, content, isFinished, name);
+      Object.assign(wrapper, refs);
+      this._setupPanelListeners(wrapper);
+    }
+    document.getElementById('chatContainer').appendChild(wrapper);
+    return wrapper;
+  },
+
+  _buildAssistantContent(container, content, isFinished, modelDisplayName) {
+    // Search card
+    const sc = document.createElement('div');
+    sc.className = 'search-card hidden';
+    sc.innerHTML = '<div class="search-header"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg><span class="search-header-label">Searched 0 sources</span><span class="search-header-arrow" style="margin-left:auto;font-size:10px">&#9656;</span></div><div class="search-body"><div class="search-query-text"></div><div class="search-links-container"></div></div>';
+    container.appendChild(sc);
+    // Thinking card
+    const tc = document.createElement('div');
+    tc.className = 'thinking-card hidden';
+    tc.innerHTML = '<div class="thinking-header"><span class="thinking-header-dot"></span><span class="thinking-header-label">Thinking</span><span class="thinking-header-timer"></span><span class="thinking-header-arrow">&#9656;</span></div><div class="thinking-body"><div class="markdown-body thinking-markdown"></div></div>';
+    container.appendChild(tc);
+    // Markdown
+    const md = document.createElement('div');
+    md.className = 'markdown-body';
+    container.appendChild(md);
+    if (content === '') {
+      if (isFinished) window.NotionAI.Utils.Markdown.setSafeMarkdown(md, '*No visible response received.*');
+      else md.innerHTML = '<div class="typing-indicator"><span></span><span></span><span></span></div>';
+    } else {
+      window.NotionAI.Utils.Markdown.setSafeMarkdown(md, content);
+      if (isFinished) { md.querySelectorAll('pre code').forEach(b=>hljs.highlightElement(b)); window.NotionAI.Utils.DOM.addCodeBlockCopyButtons(md) }
+    }
+    // Copy button at bottom of message
+    const copyBtnWrapper = document.createElement('div');
+    copyBtnWrapper.className = 'message-copy-row';
+    const cb = document.createElement('button');
+    cb.className = 'message-copy-btn';
+    cb.textContent = 'Copy';
+    cb.onclick = () => {
+      if (md) navigator.clipboard.writeText(md.innerText).then(() => { cb.textContent='Copied!'; setTimeout(()=>cb.textContent='Copy',2000) });
+    };
+    copyBtnWrapper.appendChild(cb);
+    container.appendChild(copyBtnWrapper);
+    return {
+      bubbleRef:container, mdDivRef:md,
+      searchCardRef:sc, searchExpanded:false, searchData:{queries:[],sources:[]},
+      thinkingCardRef:tc, thinkingBodyRef:tc.querySelector('.thinking-body .thinking-markdown'),
+      thinkingExpanded:false, thinkingText:'', thinkingModelDisplayName:modelDisplayName,
+      _thinkingStartTime:isFinished?null:Date.now(), _thinkingTimerInterval:null,
+    };
+  },
+
+  _setupPanelListeners(wrapper) {
+    const th = wrapper.querySelector('.thinking-header');
+    const sh = wrapper.querySelector('.search-header');
+    if (th) th.addEventListener('click', () => { wrapper.thinkingExpanded=!wrapper.thinkingExpanded; this.updateThinkingPanel(wrapper) });
+    if (sh) sh.addEventListener('click', () => { wrapper.searchExpanded=!wrapper.searchExpanded; this.updateSearchPanel(wrapper) });
+  },
+  showErrorCard(wrapper, message, code, suggestion, detail, httpStatus) {
+    const mdDiv = wrapper.mdDivRef; if (!mdDiv) return;
+    if (wrapper._thinkingTimerInterval) { clearInterval(wrapper._thinkingTimerInterval); wrapper._thinkingTimerInterval = null; }
+    if (wrapper.thinkingCardRef) wrapper.thinkingCardRef.classList.add('hidden');
+    const esc = t => { const d = document.createElement('div'); d.textContent = t; return d.innerHTML; };
+    let h = '<div class="error-card"><div class="error-card-header"><span class="error-card-icon">⚠</span><span class="error-card-title">请求失败</span>';
+    if (code) h += `<span class="error-card-code">${esc(code)}</span>`;
+    h += '</div>';
+    h += `<div class="error-card-message">${esc(message)}</div>`;
+    if (suggestion) h += `<div class="error-card-suggestion">💡 ${esc(suggestion)}</div>`;
+    if (detail) h += `<details class="error-card-details"><summary>技术详情</summary><pre>${esc(detail)}</pre></details>`;
+    h += '</div>';
+    mdDiv.innerHTML = h; mdDiv.classList.remove('streaming-cursor');
+    window.NotionAI.Utils.DOM.scrollToBottom();
+  }
+};
+</script>
+
+<script>
+/* ===== STREAMING ===== */
+window.NotionAI.Chat.Streaming = {
+  async streamResponse(chat, model, aiWrapper) {
+    const searchState = { queries: [], sources: [] };
+    let thinkingText = '', fullAiReply = '';
+    const requestMessages = chat.messages.filter(m=>m&&typeof m==='object'&&(m.role==='user'||m.role==='assistant')).map(m=>({role:m.role,content:String(m.content||''),thinking:String(m.thinking||'')}));
+    STATE.controller = new AbortController();
+    try {
+      const response = await fetch(`${window.NotionAI.Core.State.get('baseUrl')}/v1/chat/completions`, {
+        method:'POST', headers:{'Content-Type':'application/json','Authorization':`Bearer ${window.NotionAI.Core.State.get('apiKey')}`,'X-Client-Type':window.NotionAI.Core.Constants.CLIENT_TYPE},
+        body:JSON.stringify({model,messages:requestMessages,conversation_id:chat.conversationId||null,stream:true}), signal:STATE.controller.signal
+      });
+      if(window.NotionAI.API.Client.checkMemoryStatus(response))this.notifyMemoryDegradedOnce();
+      const bid=window.NotionAI.API.Client.getConversationId(response);
+      if(bid&&chat.conversationId!==bid){window.NotionAI.Chat.Storage.updateConversationId(chat.id,bid);chat.conversationId=bid}
+      if(!response.ok){
+        let ei={message:`HTTP Error: ${response.status}`,code:'',suggestion:''};
+        try{const eb=await response.json();if(eb?.error){ei.message=eb.error.message||ei.message;ei.code=eb.error.code||'';ei.suggestion=eb.error.suggestion||'';ei.detail=eb.error.detail||''}else if(eb?.detail){ei.message=eb.detail}}catch(e){}
+        if(response.status===401){ei.message=ei.message||"API KEY doesn't match.";ei.suggestion=ei.suggestion||"Check your API Key in Settings."}
+        const err=new Error(ei.message);err.errorCode=ei.code;err.suggestion=ei.suggestion;err.errorDetail=ei.detail;err.httpStatus=response.status;throw err;
+      }
+      return await this.processStream(response,aiWrapper,searchState,thinkingText,fullAiReply);
+    } catch(err) {
+      if(err.name!=='AbortError'){console.error('API Error:',err);window.NotionAI.Chat.Renderer.showErrorCard(aiWrapper,err.message,err.errorCode||'',err.suggestion||'',err.errorDetail||'',err.httpStatus||0)}
+      throw err;
+    }
+  },
+  async processStream(response,aiWrapper,searchState,thinkingText,fullAiReply) {
+    const reader=response.body.getReader(),decoder=new TextDecoder('utf-8');let buf='';
+    while(true){const{done,value}=await reader.read();if(done)break;buf+=decoder.decode(value,{stream:true});const evts=buf.split('\n\n');buf=evts.pop()||'';
+      for(const eb of evts){for(let line of eb.split('\n')){line=line.trim();if(!line.startsWith('data:'))continue;const p=line.slice(5).trim();const r=this.consumePayload(p,aiWrapper,searchState,thinkingText,fullAiReply);if(r.thinkingText!==undefined)thinkingText=r.thinkingText;if(r.fullAiReply!==undefined)fullAiReply=r.fullAiReply}}}
+    if(buf.trim().startsWith('data:')){const p=buf.trim().slice(5).trim();const r=this.consumePayload(p,aiWrapper,searchState,thinkingText,fullAiReply);if(r.thinkingText!==undefined)thinkingText=r.thinkingText;if(r.fullAiReply!==undefined)fullAiReply=r.fullAiReply}
+    return{fullAiReply,thinkingText,searchState};
+  },
+  consumePayload(payload,aiWrapper,searchState,thinkingText,fullAiReply) {
+    if(!payload||payload==='[DONE]')return{thinkingText,fullAiReply};
+    let d;try{d=JSON.parse(payload)}catch(e){return{thinkingText,fullAiReply}}
+    if(d?.type==='search_metadata'){this.mergeSearchState(searchState,d.searches||{});aiWrapper.searchData=searchState;window.NotionAI.Chat.Renderer.updateSearchPanel(aiWrapper);return{thinkingText,fullAiReply}}
+    if(d?.type==='thinking_chunk'){const c=typeof d.text==='string'?d.text:'';if(c){thinkingText+=c;aiWrapper.thinkingText=thinkingText;window.NotionAI.Chat.Renderer.updateThinkingPanel(aiWrapper)}return{thinkingText,fullAiReply}}
+    if(d?.type==='content_replace'){const r=typeof d.content==='string'?d.content:'';if(r){fullAiReply=r;window.NotionAI.Chat.Renderer.updateAIMessage(aiWrapper,fullAiReply,false)}return{thinkingText,fullAiReply}}
+    if(d?.type==='thinking_replace'){thinkingText=typeof d.thinking==='string'?d.thinking:'';aiWrapper.thinkingText=thinkingText;window.NotionAI.Chat.Renderer.updateThinkingPanel(aiWrapper);return{thinkingText,fullAiReply}}
+    const dr=d?.choices?.[0]?.delta?.reasoning_content||'';
+    if(dr){thinkingText+=dr;aiWrapper.thinkingText=thinkingText;window.NotionAI.Chat.Renderer.updateThinkingPanel(aiWrapper);return{thinkingText,fullAiReply}}
+    const dc=d?.choices?.[0]?.delta?.content||'';
+    if(dc){fullAiReply+=dc;window.NotionAI.Chat.Renderer.updateAIMessage(aiWrapper,fullAiReply,false);return{thinkingText,fullAiReply}}
+    return{thinkingText,fullAiReply};
+  },
+  mergeSearchState(target,payload) {
+    const n=window.NotionAI.Utils.Validation.normalizeSearchPayload(payload);
+    n.queries.forEach(q=>{if(!target.queries.includes(q))target.queries.push(q)});
+    n.sources.forEach(s=>{if(!target.sources.some(e=>e.title===s.title&&e.url===s.url))target.sources.push(s)});
+  },
+  notifyMemoryDegradedOnce(){if(!this._memoryNotified){this._memoryNotified=true;const b=document.getElementById('memoryBanner');if(b)b.classList.remove('hidden')}}
+};
+
+/* ===== UI: THEME ===== */
+window.NotionAI.UI.Theme = {
+  toggle(){const c=window.NotionAI.Core.State.get('theme');const n=c==='dark'?'light':'dark';window.NotionAI.Core.State.set('theme',n);localStorage.setItem('theme',n);this.apply(n)},
+  apply(t){
+    document.documentElement.setAttribute('data-theme',t);
+    const sun=document.getElementById('sunIcon'),moon=document.getElementById('moonIcon');
+    const hljsLight=document.getElementById('hljs-light'),hljsDark=document.getElementById('hljs-dark');
+    if(t==='dark'){
+      document.documentElement.classList.add('dark');
+      if(sun)sun.classList.remove('hidden');if(moon)moon.classList.add('hidden');
+      if(hljsLight)hljsLight.disabled=true;if(hljsDark)hljsDark.disabled=false;
+    } else {
+      document.documentElement.classList.remove('dark');
+      if(sun)sun.classList.add('hidden');if(moon)moon.classList.remove('hidden');
+      if(hljsLight)hljsLight.disabled=false;if(hljsDark)hljsDark.disabled=true;
+    }
+  },
+  init(){this.apply(window.NotionAI.Core.State.get('theme'))}
+};
+
+/* ===== UI: SIDEBAR ===== */
+window.NotionAI.UI.Sidebar = {
+  toggle(show){const s=document.getElementById('sidebar'),b=document.getElementById('mobileBackdrop');if(show){s.classList.add('open');b.classList.remove('hidden')}else{s.classList.remove('open');b.classList.add('hidden')}},
+  open(){this.toggle(true)},close(){this.toggle(false)}
+};
+
+/* ===== UI: INPUT ===== */
+window.NotionAI.UI.Input = {
+  autoResize(){const i=document.getElementById('chatInput');i.style.height='24px';i.style.height=Math.min(i.scrollHeight,160)+'px'},
+  handleKeydown(e,onSend){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();onSend()}},
+  clear(){document.getElementById('chatInput').value='';this.autoResize()},
+  focus(){document.getElementById('chatInput').focus()},
+  getValue(){return document.getElementById('chatInput').value.trim()},
+  enable(){document.getElementById('chatInput').disabled=false;document.getElementById('sendBtn').disabled=false},
+  disable(){document.getElementById('chatInput').disabled=true}
+};
+
+/* ===== UI: MODAL ===== */
+window.NotionAI.UI.Modal = {
+  openRenameModal(chatId){const chats=window.NotionAI.Core.State.get('chats');const chat=chats.find(c=>c.id===chatId);if(!chat)return;window.NotionAI.Core.State.set('chatToRename',chatId);const input=document.getElementById('renameModalInput');input.value=chat.title;document.getElementById('renameModal').classList.remove('hidden');setTimeout(()=>input.focus(),50)},
+  closeRenameModal(){document.getElementById('renameModal').classList.add('hidden');window.NotionAI.Core.State.set('chatToRename',null)},
+  saveRename(){const id=window.NotionAI.Core.State.get('chatToRename');if(!id)return;const t=document.getElementById('renameModalInput').value.trim();if(t)window.NotionAI.Chat.Manager.renameChat(id,t);this.closeRenameModal()}
+};
+</script>
+
+<script>
+/* ===== CHAT MANAGER ===== */
+window.NotionAI.Chat.Manager = {
+  startNewChat() {
+    if(STATE.isGenerating)return;
+    const id=Date.now().toString();
+    window.NotionAI.Core.State.set('currentChatId',id);
+    document.getElementById('headerTitle').classList.add('hidden');
+    document.getElementById('chatContainer').innerHTML='';
+    window.NotionAI.UI.Input.clear();
+    document.getElementById('welcomeScreen').classList.remove('hidden');
+    if(typeof updateWelcomeGreeting==='function')updateWelcomeGreeting();
+    if(typeof renderWelcomeSuggestions==='function')renderWelcomeSuggestions();
+    if(window.innerWidth<768)window.NotionAI.UI.Sidebar.close();
+    window.NotionAI.UI.Input.focus();
+    this.renderChatList();
+  },
+  selectChat(chatId) {
+    if(STATE.isGenerating)return;
+    const chats=STATE.chats,chat=chats.find(c=>c.id===chatId);if(!chat)return;
+    window.NotionAI.Core.State.set('currentChatId',chatId);
+    document.getElementById('welcomeScreen').classList.add('hidden');
+    document.getElementById('chatContainer').innerHTML='';
+    document.getElementById('headerTitle').textContent=chat.title;
+    document.getElementById('headerTitle').classList.remove('hidden');
+    chat.messages.forEach(msg=>{
+      const w=window.NotionAI.Chat.Renderer.appendMessage(msg.role,msg.content,true,msg.modelDisplayName||null);
+      if(msg.role==='assistant'){
+        const rt=typeof msg.thinking==='string'?msg.thinking:'';
+        const rs=window.NotionAI.Utils.Validation.normalizeSearchPayload(msg.search);
+        if(rt.trim()){w.thinkingText=rt;window.NotionAI.Chat.Renderer.updateThinkingPanel(w)}
+        if(rs.queries.length+rs.sources.length>0){w.searchData=rs;window.NotionAI.Chat.Renderer.updateSearchPanel(w)}
+      }
+    });
+    if(window.innerWidth<768)window.NotionAI.UI.Sidebar.close();
+    window.NotionAI.Utils.DOM.scrollToBottom();
+    this.renderChatList();
+  },
+  async deleteChat(chatId) {
+    if(STATE.isGenerating)return;
+    const chats=STATE.chats,chat=chats.find(c=>c.id===chatId);if(!chat)return;
+    if(chat.conversationId){const ok=await window.NotionAI.API.Client.deleteConversation(chat.conversationId);if(!ok)return}
+    window.NotionAI.Chat.Storage.deleteChat(chatId);
+    if(STATE.currentChatId===chatId)this.startNewChat();
+    this.renderChatList();
+  },
+  renameChat(chatId,newTitle) {
+    window.NotionAI.Chat.Storage.updateChatTitle(chatId,newTitle);
+    if(STATE.currentChatId===chatId)document.getElementById('headerTitle').textContent=newTitle;
+    this.renderChatList();
+  },
+  toggleStar(chatId){window.NotionAI.Chat.Storage.toggleStar(chatId);this.renderChatList()},
+
+  renderChatList() {
+    const cl=document.getElementById('chatList');cl.innerHTML='';
+    const chats=STATE.chats;
+    const starred=chats.filter(c=>c.starred).sort((a,b)=>b.id-a.id);
+    const recent=chats.filter(c=>!c.starred).sort((a,b)=>b.id-a.id);
+    const searchVal=(document.getElementById('searchInput')?.value||'').trim().toLowerCase();
+
+    const renderItems=(items,filterFn)=>{
+      let filtered=filterFn?items.filter(filterFn):items;
+      filtered.forEach(chat=>{
+        const item=document.createElement('div');
+        item.className=`chat-item${chat.id===STATE.currentChatId?' active':''}`;
+        item.onclick=()=>this.selectChat(chat.id);
+        const title=document.createElement('span');title.className='chat-item-title';title.textContent=chat.title;
+        const mc=document.createElement('div');mc.className='chat-dropdown-container';mc.style.cssText='position:relative;display:flex;align-items:center';
+        const mb=document.createElement('button');mb.className='chat-item-menu-btn';
+        mb.innerHTML='<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1.5"/><circle cx="6" cy="12" r="1.5"/><circle cx="18" cy="12" r="1.5"/></svg>';
+        mb.onclick=e=>{e.stopPropagation();this.toggleChatDropdown(e,chat.id)};
+        const dd=this._createDropdown(chat);
+        mc.appendChild(mb);mc.appendChild(dd);
+        item.appendChild(title);item.appendChild(mc);cl.appendChild(item);
+      });
+    };
+    const filter=searchVal?c=>c.title.toLowerCase().includes(searchVal):null;
+
+    if(starred.length>0){const h=document.createElement('div');h.className='chat-section-header';h.textContent='STARRED';cl.appendChild(h);renderItems(starred,filter)}
+    if(recent.length>0){
+      // Group by date
+      const today=new Date();today.setHours(0,0,0,0);
+      const yesterday=new Date(today);yesterday.setDate(yesterday.getDate()-1);
+      const todayItems=[],yesterdayItems=[],olderItems=[];
+      let filtered=filter?recent.filter(filter):recent;
+      filtered.forEach(c=>{const d=new Date(parseInt(c.id));if(d>=today)todayItems.push(c);else if(d>=yesterday)yesterdayItems.push(c);else olderItems.push(c)});
+      if(todayItems.length){const h=document.createElement('div');h.className='chat-section-header';h.textContent='TODAY';cl.appendChild(h);renderItems(todayItems)}
+      if(yesterdayItems.length){const h=document.createElement('div');h.className='chat-section-header';h.textContent='YESTERDAY';cl.appendChild(h);renderItems(yesterdayItems)}
+      if(olderItems.length){const h=document.createElement('div');h.className='chat-section-header';h.textContent='OLDER';cl.appendChild(h);renderItems(olderItems)}
+    }
+  },
+
+  _createDropdown(chat) {
+    const dd=document.createElement('div');dd.id=`dropdown-${chat.id}`;dd.className='custom-dropdown';
+    const actions=[{action:'star',label:chat.starred?'Unstar':'Star'},{action:'rename',label:'Rename'},{action:'divider'},{action:'delete',label:'Delete',danger:true}];
+    actions.forEach(a=>{
+      if(a.action==='divider'){const d=document.createElement('div');d.className='dropdown-divider';dd.appendChild(d);return}
+      const btn=document.createElement('button');btn.className=`dropdown-item${a.danger?' danger':''}`;btn.textContent=a.label;
+      btn.onclick=e=>{e.stopPropagation();this.closeChatDropdown();this.handleMenuAction(a.action,chat.id)};
+      dd.appendChild(btn);
+    });return dd;
+  },
+  handleMenuAction(action,chatId){
+    if(action==='star')this.toggleStar(chatId);
+    else if(action==='rename')window.NotionAI.UI.Modal.openRenameModal(chatId);
+    else if(action==='delete')this.deleteChat(chatId);
+  },
+  toggleChatDropdown(e,chatId){
+    e.stopPropagation();
+    if(this._activeDropdownId&&this._activeDropdownId!==chatId)this.closeChatDropdown();
+    const m=document.getElementById(`dropdown-${chatId}`);
+    if(m){if(m.classList.contains('open')){m.classList.remove('open');this._activeDropdownId=null}else{m.classList.add('open');this._activeDropdownId=chatId}}
+  },
+  closeChatDropdown(){if(this._activeDropdownId){const m=document.getElementById(`dropdown-${this._activeDropdownId}`);if(m)m.classList.remove('open');this._activeDropdownId=null}}
+};
+document.addEventListener('click',e=>{if(!e.target.closest('.chat-dropdown-container'))window.NotionAI.Chat.Manager.closeChatDropdown()});
+</script>
+
+<script>
+/* ===== APP ENTRY POINT ===== */
+let thinkingIndicatorEl=null,thinkingTimerInterval=null,thinkingStartTime=null;
+
+function showThinkingIndicator(){
+  removeThinkingIndicator();
+  thinkingStartTime=Date.now();
+  thinkingIndicatorEl=document.createElement('div');
+  thinkingIndicatorEl.className='thinking-indicator fade-in';
+  thinkingIndicatorEl.innerHTML='<div class="thinking-indicator-inner">Thinking &middot; <span class="thinking-timer-text">0s</span></div>';
+  document.getElementById('chatContainer').appendChild(thinkingIndicatorEl);
+  window.NotionAI.Utils.DOM.scrollToBottom();
+  const ts=thinkingIndicatorEl.querySelector('.thinking-timer-text');
+  thinkingTimerInterval=setInterval(()=>{if(ts&&thinkingStartTime)ts.textContent=Math.round((Date.now()-thinkingStartTime)/1000)+'s'},1000);
+}
+function removeThinkingIndicator(){
+  if(thinkingTimerInterval){clearInterval(thinkingTimerInterval);thinkingTimerInterval=null}
+  if(thinkingIndicatorEl&&thinkingIndicatorEl.parentNode)thinkingIndicatorEl.parentNode.removeChild(thinkingIndicatorEl);
+  thinkingIndicatorEl=null;thinkingStartTime=null;
+}
+
+function updateWelcomeGreeting(){
+  const el=document.getElementById('welcomeGreeting');if(!el)return;
+  const h=new Date().getHours();
+  // Large greeting pool organized by time period
+  const pools={
+    earlyMorning:[ // 5:00-7:59
+      "Early riser. The world is quiet.",
+      "Dawn thinking. What's first today?",
+      "Up before the noise. Good call.",
+      "Fresh morning. Fresh start.",
+      "The early hours are yours.",
+      "Sunrise mode. What are we building?",
+      "Before the day begins.",
+      "Quiet morning. Clear mind.",
+      "First light. First thoughts.",
+      "The best ideas come early.",
+    ],
+    morning:[ // 8:00-11:59
+      "Good morning.",
+      "Morning. What's on your mind?",
+      "Ready for a productive morning.",
+      "Morning clarity. Let's think.",
+      "A good morning to solve things.",
+      "Morning momentum starts here.",
+      "Clear morning. What do you need?",
+      "Let's make this morning count.",
+      "Good morning. What are we working on?",
+      "Morning focus. I'm here.",
+      "Bright morning ahead.",
+      "Coffee and code. A classic.",
+    ],
+    midday:[ // 12:00-13:59
+      "Good afternoon.",
+      "Midday reset. What's next?",
+      "Lunch break thinking.",
+      "Afternoon begins. Let's go.",
+      "Midday. Perfect time to regroup.",
+      "The afternoon stretch. What do you need?",
+      "Post-lunch clarity.",
+      "Halfway through. Still sharp.",
+    ],
+    afternoon:[ // 14:00-17:59
+      "Good afternoon.",
+      "Afternoon deep work.",
+      "The productive hours.",
+      "Afternoon momentum.",
+      "Still plenty of daylight left.",
+      "Afternoon focus. What's the task?",
+      "Let's finish strong today.",
+      "The afternoon push. Ready.",
+      "Golden hours for getting things done.",
+      "Steady afternoon. What do you need?",
+    ],
+    evening:[ // 18:00-20:59
+      "Good evening.",
+      "Evening mode. Winding down or ramping up?",
+      "The evening shift.",
+      "Quiet evening. Good for thinking.",
+      "Evening hours. What's on your mind?",
+      "Settling in for the evening.",
+      "Evening calm. Let's work through something.",
+      "The day slows down. Ideas don't.",
+      "Evening focus.",
+      "A good evening to figure things out.",
+    ],
+    night:[ // 21:00-22:59
+      "Night owl mode.",
+      "Late evening. Still going?",
+      "The night is young.",
+      "Night session. Let's be productive.",
+      "Quiet night. Deep thoughts.",
+      "Burning the midnight oil, almost.",
+      "Night thinking hits different.",
+      "The world sleeps. We work.",
+    ],
+    lateNight:[ // 23:00-4:59
+      "Late night session.",
+      "The witching hour. What are we solving?",
+      "Can't sleep? Let's build something.",
+      "Late night, clear mind.",
+      "The quiet hours. Best for deep work.",
+      "Night shift. I'm here.",
+      "3 AM energy. Let's use it.",
+      "The world is asleep. We're not.",
+      "Late night debugging?",
+      "Midnight oil. What's the plan?",
+    ]
+  };
+  let pool;
+  if(h>=5&&h<8)pool=pools.earlyMorning;
+  else if(h>=8&&h<12)pool=pools.morning;
+  else if(h>=12&&h<14)pool=pools.midday;
+  else if(h>=14&&h<18)pool=pools.afternoon;
+  else if(h>=18&&h<21)pool=pools.evening;
+  else if(h>=21&&h<23)pool=pools.night;
+  else pool=pools.lateNight;
+  // Pick a random greeting, avoid repeating the last one shown
+  const lastGreeting=sessionStorage.getItem('_lastGreeting')||'';
+  let pick=pool[Math.floor(Math.random()*pool.length)];
+  if(pool.length>1){let tries=0;while(pick===lastGreeting&&tries<5){pick=pool[Math.floor(Math.random()*pool.length)];tries++}}
+  sessionStorage.setItem('_lastGreeting',pick);
+  el.textContent=pick;
+}
+
+/* ===== WELCOME SUGGESTIONS ===== */
+const SUGGESTION_POOLS={
+  general:[
+    "Explain a complex concept in simple terms",
+    "Help me brainstorm ideas for a project",
+    "Compare two technologies and their tradeoffs",
+    "Summarize a long document or article",
+    "Help me write a professional email",
+    "Create a study plan for learning something new",
+    "Help me think through a difficult decision",
+    "Generate a list of creative solutions to a problem",
+  ],
+  coding:[
+    "Review my code and suggest improvements",
+    "Help me debug an error I'm stuck on",
+    "Explain a design pattern with examples",
+    "Write unit tests for a function",
+    "Refactor this code to be more readable",
+    "Help me design a database schema",
+    "Explain the difference between two approaches",
+    "Write a script to automate a repetitive task",
+    "Help me optimize this slow query",
+    "Walk me through setting up a new project",
+  ],
+  writing:[
+    "Help me outline a blog post",
+    "Proofread and improve my writing",
+    "Write a clear technical document",
+    "Draft a project proposal",
+    "Help me write a README for my project",
+    "Summarize meeting notes into action items",
+    "Turn rough notes into polished prose",
+    "Help me write a compelling introduction",
+  ],
+  thinking:[
+    "Help me break down a large problem",
+    "Play devil's advocate on my idea",
+    "Walk me through the pros and cons",
+    "Help me prioritize my task list",
+    "Analyze this situation from multiple angles",
+    "Help me create a decision framework",
+    "Challenge my assumptions about this approach",
+    "Help me think about edge cases I might miss",
+  ]
+};
+
+function renderWelcomeSuggestions(){
+  const container=document.getElementById('welcomeSuggestions');
+  if(!container)return;
+  container.innerHTML='';
+  // Pick 4 suggestions: 1 from each category, shuffled
+  const categories=['general','coding','writing','thinking'];
+  const picks=categories.map(cat=>{
+    const pool=SUGGESTION_POOLS[cat];
+    return pool[Math.floor(Math.random()*pool.length)];
+  });
+  // Shuffle
+  for(let i=picks.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[picks[i],picks[j]]=[picks[j],picks[i]]}
+  picks.forEach(text=>{
+    const btn=document.createElement('button');
+    btn.className='welcome-suggestion';
+    btn.innerHTML='<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg><span>'+text+'</span>';
+    btn.onclick=()=>{
+      document.getElementById('chatInput').value=text;
+      handleSend();
+    };
+    container.appendChild(btn);
+  });
+}
+
+function populateModels(){
+  const list=document.getElementById('simpleModelList');list.innerHTML='';
+  const groups=window.NotionAI.Core.Constants.MODEL_GROUPS;
+  const current=window.NotionAI.API.Models.getCurrentModel();
+  groups.forEach((group,gi)=>{
+    const label=document.createElement('div');label.className='model-group-label';label.textContent=group.label;list.appendChild(label);
+    group.models.forEach(model=>{
+      const sel=model.id===current;
+      const btn=document.createElement('button');btn.type='button';btn.className=`model-option${sel?' selected':''}`;
+      const providerInitial=group.label.charAt(0);
+      btn.innerHTML=`<div class="model-option-left"><span class="model-option-provider-badge">${providerInitial}</span><span class="model-option-name">${model.label}</span>${model.badge?`<span class="model-option-badge">${model.badge}</span>`:''}</div><svg class="model-option-check" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>`;
+      btn.onclick=e=>{e.stopPropagation();handleModelSelect(model.id,model.label,group.label)};
+      list.appendChild(btn);
+    });
+    if(gi<groups.length-1){const d=document.createElement('div');d.className='model-group-divider';list.appendChild(d)}
+  });
+}
+
+function handleModelSelect(modelId,label,provider){
+  window.NotionAI.API.Models.setCurrentModel(modelId,label);
+  document.getElementById('modelTriggerText').textContent=label;
+  document.getElementById('modelTriggerProvider').textContent=provider;
+  document.getElementById('customModelDropdown').classList.remove('open');
+  populateModels();
+}
+
+function toggleModelDropdown(){document.getElementById('customModelDropdown').classList.toggle('open')}
+
+function _updateSendButton(isGen){
+  const btn=document.getElementById('sendBtn'),si=document.getElementById('sendIcon'),sti=document.getElementById('stopIcon');
+  if(isGen){btn.classList.add('is-generating');si.classList.add('hidden');sti.classList.remove('hidden');btn.title='Stop generation'}
+  else{btn.classList.remove('is-generating');si.classList.remove('hidden');sti.classList.add('hidden');btn.title='Send (Enter)'}
+}
+
+// Header title inline editing
+function setupHeaderTitleEditing(){
+  const ht=document.getElementById('headerTitle');
+  ht.addEventListener('click',()=>{
+    if(STATE.isGenerating||ht.classList.contains('hidden'))return;
+    const chatId=STATE.currentChatId;const chats=STATE.chats;const chat=chats.find(c=>c.id===chatId);if(!chat)return;
+    const input=document.createElement('input');input.type='text';input.className='header-title-input';input.value=chat.title;
+    ht.replaceWith(input);input.focus();input.select();
+    const save=()=>{const v=input.value.trim();if(v&&v!==chat.title)window.NotionAI.Chat.Manager.renameChat(chatId,v);
+      input.replaceWith(ht);ht.textContent=v||chat.title;ht.classList.remove('hidden')};
+    input.addEventListener('blur',save);
+    input.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();save()}if(e.key==='Escape'){input.replaceWith(ht)}});
+  });
+}
+
+// Sidebar resize
+function setupSidebarResize(){
+  const sidebar=document.getElementById('sidebar');
+  const handle=document.getElementById('sidebarResizeHandle');
+  if(!sidebar||!handle)return;
+  let startX,startW;
+  handle.addEventListener('mousedown',e=>{
+    e.preventDefault();
+    startX=e.clientX;startW=sidebar.offsetWidth;
+    handle.classList.add('active');
+    sidebar.style.transition='none';
+    const onMove=ev=>{
+      const w=Math.min(400,Math.max(160,startW+(ev.clientX-startX)));
+      sidebar.style.width=w+'px';
+    };
+    const onUp=()=>{
+      handle.classList.remove('active');
+      sidebar.style.transition='';
+      document.removeEventListener('mousemove',onMove);
+      document.removeEventListener('mouseup',onUp);
+    };
+    document.addEventListener('mousemove',onMove);
+    document.addEventListener('mouseup',onUp);
+  });
+}
+
+async function handleSend(){
+  if(STATE.isGenerating)return;
+  const text=window.NotionAI.UI.Input.getValue();if(!text)return;
+  let chat=STATE.chats.find(c=>c.id===STATE.currentChatId);
+  if(!chat){chat={id:STATE.currentChatId,title:text.length>30?text.substring(0,30)+'...':text,messages:[],conversationId:null};STATE.chats.push(chat);document.getElementById('headerTitle').textContent=chat.title;document.getElementById('headerTitle').classList.remove('hidden')}
+  window.NotionAI.UI.Input.clear();
+  document.getElementById('welcomeScreen').classList.add('hidden');
+  chat.messages.push({role:'user',content:text});
+  window.NotionAI.Chat.Renderer.appendMessage('user',text,true);
+  window.NotionAI.Chat.Storage.saveChats();
+  window.NotionAI.Chat.Manager.renderChatList();
+  window.NotionAI.Utils.DOM.scrollToBottom();
+  showThinkingIndicator();
+  const selectedModel=window.NotionAI.API.Models.getCurrentModel();
+  const selectedModelDisplayName=window.NotionAI.API.Models.getCurrentModelLabel();
+  STATE.isGenerating=true;window.NotionAI.UI.Input.disable();_updateSendButton(true);
+  let aiWrapper=null,firstTokenReceived=false;
+  const origConsume=window.NotionAI.Chat.Streaming.consumePayload.bind(window.NotionAI.Chat.Streaming);
+  window.NotionAI.Chat.Streaming.consumePayload=function(payload,aw,ss,tt,far){
+    if(!firstTokenReceived&&payload&&payload!=='[DONE]'){try{const o=JSON.parse(payload);if(o?.choices?.[0]?.delta?.content||o?.choices?.[0]?.delta?.reasoning_content||o?.type==='thinking_chunk'){firstTokenReceived=true;removeThinkingIndicator()}}catch(e){}}
+    return origConsume(payload,aw,ss,tt,far);
+  };
+  try{
+    aiWrapper=window.NotionAI.Chat.Renderer.appendMessage('assistant','',false,selectedModelDisplayName);
+    aiWrapper._thinkingStartTime=Date.now();
+    const timerEl=aiWrapper.thinkingCardRef?.querySelector('.thinking-header-timer');
+    if(timerEl)aiWrapper._thinkingTimerInterval=setInterval(()=>{if(aiWrapper._thinkingStartTime)timerEl.textContent=Math.round((Date.now()-aiWrapper._thinkingStartTime)/1000)+'s'},1000);
+    window.NotionAI.Utils.DOM.scrollToBottom();
+    const result=await window.NotionAI.Chat.Streaming.streamResponse(chat,selectedModel,aiWrapper);
+    removeThinkingIndicator();
+    if(aiWrapper._thinkingTimerInterval){clearInterval(aiWrapper._thinkingTimerInterval);aiWrapper._thinkingTimerInterval=null}
+    const ns=window.NotionAI.Utils.Validation.normalizeSearchPayload(result.searchState);
+    if(result.fullAiReply.trim()){
+      window.NotionAI.Chat.Renderer.updateAIMessage(aiWrapper,result.fullAiReply,true);
+      chat.messages.push({role:'assistant',content:result.fullAiReply,thinking:result.thinkingText,search:ns,modelDisplayName:selectedModelDisplayName});
+      window.NotionAI.Chat.Storage.saveChats();
+    }else{window.NotionAI.Chat.Renderer.updateAIMessage(aiWrapper,'*No visible response received.*',true)}
+  }catch(err){removeThinkingIndicator();if(aiWrapper?._thinkingTimerInterval)clearInterval(aiWrapper._thinkingTimerInterval);if(err.name!=='AbortError')console.error('API Error:',err)}
+  finally{window.NotionAI.Chat.Streaming.consumePayload=origConsume;STATE.isGenerating=false;window.NotionAI.UI.Input.enable();window.NotionAI.UI.Input.focus();STATE.controller=null;_updateSendButton(false)}
+}
+
+function init(){
+  window.NotionAI.Chat.Storage.loadChats();
+  window.NotionAI.Chat.Storage.saveChats();
+  window.NotionAI.UI.Theme.init();
+  window.NotionAI.API.Models.loadModels();
+  window.NotionAI.Chat.Manager.renderChatList();
+  updateWelcomeGreeting();
+  renderWelcomeSuggestions();
+  populateModels();
+  setupHeaderTitleEditing();
+  setupSidebarResize();
+
+  // Event listeners
+  document.getElementById('themeToggleBtn').addEventListener('click',()=>window.NotionAI.UI.Theme.toggle());
+  document.getElementById('newChatBtn').addEventListener('click',()=>window.NotionAI.Chat.Manager.startNewChat());
+  document.getElementById('openSidebarBtn').addEventListener('click',()=>window.NotionAI.UI.Sidebar.open());
+  document.getElementById('mobileBackdrop').addEventListener('click',()=>window.NotionAI.UI.Sidebar.close());
+  document.getElementById('chatInput').addEventListener('input',()=>window.NotionAI.UI.Input.autoResize());
+  document.getElementById('chatInput').addEventListener('keydown',e=>window.NotionAI.UI.Input.handleKeydown(e,handleSend));
+  document.getElementById('sendBtn').addEventListener('click',()=>{if(STATE.isGenerating){if(STATE.controller)STATE.controller.abort()}else handleSend()});
+  document.getElementById('memoryBannerClose').addEventListener('click',()=>document.getElementById('memoryBanner').classList.add('hidden'));
+  document.getElementById('settingsBtn').addEventListener('click',()=>window.NotionAI.API.Settings.open());
+  document.getElementById('cancelSettingsBtn').addEventListener('click',()=>window.NotionAI.API.Settings.close());
+  document.getElementById('saveSettingsBtn').addEventListener('click',()=>window.NotionAI.API.Settings.save());
+  document.getElementById('cancelRenameBtn').addEventListener('click',()=>window.NotionAI.UI.Modal.closeRenameModal());
+  document.getElementById('saveRenameBtn').addEventListener('click',()=>window.NotionAI.UI.Modal.saveRename());
+  document.getElementById('renameModalInput').addEventListener('keydown',e=>{if(e.key==='Enter')window.NotionAI.UI.Modal.saveRename();if(e.key==='Escape')window.NotionAI.UI.Modal.closeRenameModal()});
+  document.getElementById('modelTriggerBtn').addEventListener('click',e=>{e.stopPropagation();toggleModelDropdown()});
+  document.addEventListener('click',e=>{const dd=document.getElementById('customModelDropdown');if(!dd.contains(e.target)&&e.target.id!=='modelTriggerBtn')dd.classList.remove('open')});
+  document.getElementById('searchInput').addEventListener('input',()=>window.NotionAI.Chat.Manager.renderChatList());
+
+  if(!STATE.currentChatId)window.NotionAI.Chat.Manager.startNewChat();
+}
+
+setInterval(updateWelcomeGreeting,60000);
+window.addEventListener('DOMContentLoaded',init);
+</script>
+</body>
+</html>

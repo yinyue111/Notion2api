@@ -1,0 +1,11 @@
+requests
+cloudscraper
+python-dotenv
+fastapi
+uvicorn[standard]
+pydantic
+slowapi
+httpx
+websocket-client
+bcrypt
+cryptography

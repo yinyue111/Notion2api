@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Notion2API 管理面板</title>
+<link rel="stylesheet" href="/admin.css">
+</head>
+<body>
+<div id="login-view" class="login-wrap hidden">
+  <form id="login-form" class="login-card" autocomplete="on">
+    <div class="brand big">Notion2API</div>
+    <p class="muted">管理面板登录</p>
+    <label>用户名<input id="lu" name="username" autocomplete="username" required></label>
+    <label>密码<input id="lp" name="password" type="password" autocomplete="current-password" required></label>
+    <button type="submit" class="btn primary">登录</button>
+    <div id="login-err" class="err"></div>
+  </form>
+</div>
+
+<div id="app-view" class="layout hidden">
+  <aside class="sidebar">
+    <div class="brand">Notion2API</div>
+    <nav>
+      <a data-page="overview" href="#overview">📊 概览</a>
+      <a data-page="accounts" href="#accounts">👤 账号</a>
+      <a data-page="requests" href="#requests">📜 请求与用量</a>
+      <a data-page="chat" href="#chat">💬 对话</a>
+    </nav>
+    <div class="side-foot">
+      <div id="who" class="muted small"></div>
+      <button id="theme-btn" class="btn ghost small">🌓 主题</button>
+      <button id="logout-btn" class="btn ghost small">退出登录</button>
+    </div>
+  </aside>
+  <main>
+    <section id="page-overview" class="page">
+      <h1>概览</h1>
+      <div id="ov-cards" class="cards"></div>
+      <h2>近 7 天</h2>
+      <div class="table-wrap"><table id="ov-days"></table></div>
+      <h2>最近错误</h2>
+      <div class="table-wrap"><table id="ov-errors"></table></div>
+    </section>
+
+    <section id="page-accounts" class="page">
+      <div class="page-head"><h1>Notion 账号</h1><button id="add-acc-btn" class="btn primary">＋ 添加账号</button></div>
+      <p class="muted small">token_v2 只写不读，仅显示末 4 位；修改后账号池即时热更新。测试 30 秒/次、额度 60 秒/次限流。</p>
+      <div class="table-wrap"><table id="acc-table"></table></div>
+    </section>
+
+    <section id="page-requests" class="page">
+      <div class="page-head"><h1>请求与用量</h1>
+        <select id="st-days"><option value="1">24 小时</option><option value="7" selected>7 天</option><option value="30">30 天</option></select>
+      </div>
+      <div id="st-cards" class="cards"></div>
+      <div class="grid2">
+        <div><h2>按模型</h2><div class="table-wrap"><table id="st-model"></table></div></div>
+        <div><h2>按账号</h2><div class="table-wrap"><table id="st-account"></table></div></div>
+      </div>
+      <h2>按天</h2><div class="table-wrap"><table id="st-day"></table></div>
+      <div class="page-head"><h2>请求日志 <span class="muted small">（仅元数据，保留 30 天）</span></h2>
+        <div class="filters">
+          <select id="rq-status"><option value="">全部</option><option value="ok">成功</option><option value="error">错误</option></select>
+          <input id="rq-model" placeholder="模型">
+          <button id="rq-refresh" class="btn small">刷新</button>
+        </div>
+      </div>
+      <div class="table-wrap"><table id="rq-table"></table></div>
+      <div class="pager"><button id="rq-prev" class="btn small">上一页</button><span id="rq-info" class="muted small"></span><button id="rq-next" class="btn small">下一页</button></div>
+    </section>
+
+    <section id="page-chat" class="page page-chat">
+      <iframe id="chat-frame" title="chat" src="about:blank"></iframe>
+    </section>
+  </main>
+</div>
+
+<dialog id="acc-dialog">
+  <form id="acc-form" method="dialog">
+    <h2 id="acc-dialog-title">添加账号</h2>
+    <label>备注名<input name="label" maxlength="200"></label>
+    <label class="tok">token_v2<input name="token_v2" type="password" autocomplete="off" maxlength="4000"></label>
+    <label class="new-only">space_id<input name="space_id" maxlength="100"></label>
+    <label class="new-only">user_id<input name="user_id" maxlength="100"></label>
+    <label>邮箱（可选）<input name="user_email" maxlength="200"></label>
+    <div class="err" id="acc-err"></div>
+    <div class="row-end"><button value="cancel" class="btn ghost" formnovalidate>取消</button><button id="acc-save" value="ok" class="btn primary">保存</button></div>
+  </form>
+</dialog>
+<div id="toast"></div>
+<script src="/admin.js"></script>
+</body>
+</html>
