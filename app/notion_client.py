@@ -144,6 +144,12 @@ def _with_identity_nudge(transcript: list, fresh_ids: bool = True) -> list:
     return out
 
 
+def _norm_turn(text) -> str:
+    t = str(text or "")
+    t = re.sub(r"\\<(/?)(tool_call|tool_result)\\>", r"<\1\2>", t)
+    return re.sub(r"\s+", "", t)
+
+
 class NotionOpusAPI:
     def __init__(self, account_config: dict):
         """
@@ -241,6 +247,14 @@ class NotionOpusAPI:
         """Out-of-credits / usage-limit (not the transient fair-use 429/503 limiter):
         mark the account exhausted so the pool fails over until the recheck time."""
         t = str(text or "")
+        if status == 401:
+            secs = float(os.getenv("ACCOUNT_AUTH_RECHECK_SECONDS", "900") or 900)
+            self.exhausted_until = time.time() + secs
+            self.exhausted_reason = f"AUTH HTTP 401 (token_v2 expired/revoked?): {t[:120]}"
+            logger.error("Account authentication failed (token expired?)", extra={"request_info": {
+                "event": "account_auth_failed", "account": self.account_key, "status": status,
+                "recheck_in": int(secs), "excerpt": t[:200]}})
+            return
         if status == 402 or (_QUOTA_RE.search(t) and not _TRANSIENT_RE.search(t)):
             secs = float(os.getenv("ACCOUNT_EXHAUSTED_RECHECK_SECONDS", "1800") or 1800)
             self.exhausted_until = time.time() + secs
@@ -411,6 +425,7 @@ class NotionOpusAPI:
                     "Thread auto-deleted from Notion home",
                     extra={"request_info": {"event": "thread_deleted", "thread_id": thread_id}},
                 )
+                return True
             else:
                 logger.warning(
                     f"Thread deletion failed: HTTP {resp.status_code}",
@@ -423,6 +438,17 @@ class NotionOpusAPI:
             )
 
     def stream_response(self, transcript: list, thread_id: Optional[str] = None, meta: Optional[dict] = None) -> Generator[dict[str, Any], None, None]:
+        """Long-generation handling (app.long_gen): plan-then-write for xhigh/max long
+        generations and auto-continue of output-capped answers, around _stream_guarded."""
+        from app import long_gen
+        meta = meta if meta is not None else {}
+        if long_gen.should_plan(transcript, thread_id, meta, self._transcript_effort(transcript)):
+            yield from long_gen.plan_then_write(self, transcript, meta)
+            return
+        yield from long_gen.with_auto_continue(self, self._stream_guarded(transcript, thread_id, meta),
+                                               transcript, meta)
+
+    def _stream_guarded(self, transcript: list, thread_id: Optional[str] = None, meta: Optional[dict] = None) -> Generator[dict[str, Any], None, None]:
         """Persona guard around _stream_response_once: on a NEW thread whose reply opens with
         Notion's own persona ("I'm Notion AI, an assistant built into Notion…") while the client
         never mentioned Notion, the head is held back (<= ~160 chars), the Notion stream is
@@ -496,6 +522,11 @@ class NotionOpusAPI:
         meta = meta if meta is not None else {}
         cur_tid = thread_id
         lang = LangSanitizer()
+        sent_norm = {_norm_turn(v.get("content")) for b in transcript if isinstance(b, dict)
+                     and b.get("type") == "agent-inference" for v in (b.get("value") or []) if isinstance(v, dict)}
+        sent_norm.discard("")
+        from app.meta_commentary import ThinkingScrubber
+        think = ThinkingScrubber() if os.getenv("NOTION_SCRUB_THINKING", "1").strip().lower() not in ("0", "false", "off", "no") else None
         for rnd in range(max_rounds + 1):
             pending: list = []
             held_final: list = []
@@ -505,6 +536,7 @@ class NotionOpusAPI:
                 src = self._retry_confirm_round(src, transcript, confirm_ids, prev_final, meta=meta)
             else:
                 src = self._retry_rate_limited(src, transcript, thread_id, meta=meta)
+                src = self._silent_close_guard(src, meta)
             for item in src:
                 cur_tid = meta.get("thread_id") or cur_tid
                 t = item.get("type") if isinstance(item, dict) else None
@@ -523,15 +555,34 @@ class NotionOpusAPI:
                 if t == "final_content":
                     if isinstance(item.get("text"), str):
                         item = {**item, "text": clean_lang(item["text"])}
+                        if _norm_turn(item["text"]) in sent_norm:
+                            # Notion's record-map "final" is a history turn we replayed (e.g. the
+                            # previous <tool_call>), not this inference: never answer with it
+                            logger.info("Dropped replayed history turn offered as final", extra={
+                                "request_info": {"event": "final_is_history", "chars": len(item["text"])}})
+                            continue
                     held_final.append(item)
                     continue
+                if t == "thinking" and think is not None and isinstance(item.get("text"), str):
+                    txt = think.feed(item["text"])
+                    if not txt:
+                        continue
+                    item = {**item, "text": txt}
                 if t == "content" and isinstance(item.get("text"), str):
+                    if think is not None and item["text"].strip():
+                        tt = think.flush(final=False)  # thinking precedes the answer: release its tail first
+                        if tt:
+                            yield {"type": "thinking", "text": tt}
                     txt = lang.feed(item["text"])
                     if not txt:
                         continue
                     item = {**item, "text": txt}
                     got_text = got_text or bool(txt.strip())
                 yield item
+            if think is not None:
+                tt = think.flush()
+                if tt:
+                    yield {"type": "thinking", "text": tt}
             tail = lang.flush()
             if tail:
                 got_text = got_text or bool(tail.strip())
@@ -547,24 +598,306 @@ class NotionOpusAPI:
             prev_final = held_final
             time.sleep(float(os.getenv("NOTION_CONFIRM_DELAY", "1.5") or 1.5))
         cur_tid = meta.get("thread_id") or cur_tid or self.current_thread_id
+        if got_text and getattr(self, "fail_streak", 0):
+            from app.account_pool import AccountPool as _AP
+            _AP.mark_ok(self)
         if not got_text and cur_tid:
             # Notion closes the stream after ~60s without output (Opus at high effort can
             # think silently for longer), but the inference keeps running server-side and
             # lands in the thread. Recover it from the thread record instead of answering empty.
-            recovered = self._poll_thread_inference(cur_tid)
+            sent = {str(v.get("content") or "").strip() for b in transcript if isinstance(b, dict)
+                    and b.get("type") == "agent-inference" for v in (b.get("value") or []) if isinstance(v, dict)}
+            recovered = "" if meta.get("_cancelled") else self._recover_silent(
+                transcript, cur_tid, meta, sent)
             recovered = clean_lang(recovered or "")
             if recovered.strip():
+                got_text = True
                 yield {"type": "content", "text": recovered}
+        # Fold silent-recover / hedge billing into returned usage (original Max burn +
+        # hedge attempts). Must run even when recovery produced text from hedge only.
+        rec_usage = meta.pop("_rec_usage", None) or {}
+        rec_out = meta.pop("_rec_out", None)
+        if rec_usage:
+            for _k, _v in rec_usage.items():
+                if isinstance(_v, (int, float)) and not isinstance(_v, bool):
+                    usage_total[_k] = usage_total.get(_k, 0) + int(_v)
+        elif rec_out and not usage_total:
+            usage_total["outputTokens"] = rec_out
+        silent_exc = meta.pop("_silent_close_exc", None)
+        if silent_exc is not None and not got_text:
+            raise silent_exc  # nothing recovered: let the caller fail over as before
+        if think is not None and think.dropped:
+            logger.info("Scrubbed scaffolding remarks from thinking", extra={"request_info": {
+                "event": "thinking_scrubbed", "paragraphs": think.dropped}})
         if usage_total:
             yield {"type": "usage", "usage": usage_total}
 
-    def _poll_thread_inference(self, thread_id: str) -> str:
+    # ---- silent high-effort inferences -------------------------------------------------
+    # Notion streams no thinking text for Opus and closes a silent stream after ~60s; the
+    # inference keeps running server-side and lands in the thread record. Notion caps one
+    # inference at 40k output tokens (hidden thinking + answer): at xhigh/max a long
+    # generation (e.g. a big SVG) spends all of it thinking and ends with no text after
+    # ~7 min. So for xhigh/max we keep polling the real Max inference (short/medium tasks
+    # still answer with Max) and, in parallel, hedge with a fresh lower-effort inference;
+    # the first one with text wins. NOTION_EFFORT_HEDGE=0 disables the hedge.
+    def _silent_close_guard(self, src, meta):
+        t0 = time.time()
+        try:
+            yield from src
+        except NotionUpstreamError as exc:
+            min_s = float(os.getenv("NOTION_SILENT_CLOSE_MIN", "40") or 40)
+            if "empty stream" in str(exc) and meta.get("thread_id") and time.time() - t0 >= min_s \
+                    and not meta.get("_cancelled"):
+                meta["_silent_close_exc"] = exc
+                if not meta.get("_is_hedge"):
+                    from app.request_log import annotate_meta
+                    annotate_meta(meta, silent_close=True, silent_close_secs=int(time.time() - t0))
+                logger.info("Notion closed a silent stream; inference continues server-side", extra={
+                    "request_info": {"event": "notion_silent_close", "after_s": round(time.time() - t0),
+                                     "thread_id": meta.get("thread_id")}})
+                return
+            raise
+
+    @staticmethod
+    def _transcript_effort(transcript) -> str:
+        for b in transcript or []:
+            if isinstance(b, dict) and b.get("type") == "config" and isinstance(b.get("value"), dict):
+                v = b["value"]
+                try:
+                    return clamp_effort(get_notion_model(str(v.get("model", "") or "")),
+                                        normalize_effort(v.get("reasoningEffort"))) or ""
+                except Exception:
+                    return str(v.get("reasoningEffort") or "")
+        return ""
+
+    def _recover_silent(self, transcript, tid, meta, exclude) -> str:
+        eff = self._transcript_effort(transcript)
+        hedge_set = {e.strip() for e in os.getenv("NOTION_HEDGE_EFFORTS", "xhigh,max").split(",") if e.strip()}
+        hedge_on = os.getenv("NOTION_EFFORT_HEDGE", "1").strip().lower() not in ("0", "false", "off", "no")
+        if hedge_on and eff in hedge_set and not meta.get("_is_hedge"):
+            return self._hedged_recover(transcript, tid, meta, exclude, eff)
+        deadline = meta.get("_deadline")
+        if eff in ("high", "xhigh", "max"):
+            # a silent high-effort inference often lands minutes later (high: ~5 min for a
+            # long SVG); don't give up at the first attempt's reserved deadline
+            ext = time.time() + float(os.getenv("NOTION_SILENT_WAIT", "330") or 0)
+            deadline = max(deadline or 0, ext)
+            if meta.get("_hard_end"):
+                deadline = min(deadline, meta["_hard_end"])
+        text = self._poll_thread_inference(tid, deadline, exclude=exclude, cancel=meta)
+        if text.strip():
+            try:  # output tokens of the recovered inference (auto-continue needs them)
+                _st = self._thread_inference_state(tid, exclude)
+                meta["_rec_out"] = _st[3]
+                if _st[4]:
+                    meta["_rec_usage"] = dict(_st[4])
+            except Exception:
+                pass
+        elif eff in ("xhigh", "max") and not meta.get("_is_hedge"):
+            try:  # Max burned with no recoverable text (hedge off / wait exhausted)
+                from app import cap_memory
+                from app.request_log import annotate_meta
+                cap_memory.mark(meta.get("_conv_keys"), reason="silent_empty")
+                annotate_meta(meta, cap_memory=((meta.get("_rl") or {}).get("cap_memory") or "marked"))
+            except Exception:
+                pass
+        return text
+
+    def _thread_inference_state(self, thread_id, exclude=None):
+        """(text, finished, running, output_tokens, usage_dict) of the inference after the last user turn."""
+        st, b = self.api_post("syncRecordValuesMain", {"requests": [
+            {"pointer": {"table": "thread", "id": thread_id, "spaceId": self.space_id}, "version": -1}]}, timeout=15)
+        th = (((b or {}).get("recordMap") or {}).get("thread") or {}).get(thread_id, {}).get("value", {})
+        th = th.get("value", th) if isinstance(th, dict) else {}
+        msgs = th.get("messages") or []
+        running = bool(th.get("current_inference_id"))
+        text, finished, out, usage = "", False, None, {}
+        if msgs:
+            st, b = self.api_post("syncRecordValuesMain", {"requests": [
+                {"pointer": {"table": "thread_message", "id": m, "spaceId": self.space_id}, "version": -1}
+                for m in msgs[-6:]]}, timeout=15)
+            recs = ((b or {}).get("recordMap") or {}).get("thread_message") or {}
+            for m in msgs[-6:]:
+                v = (recs.get(m) or {}).get("value", {})
+                v = v.get("value", v) if isinstance(v, dict) else {}
+                step = v.get("step") or {}
+                if step.get("type") == "user":
+                    text, finished, out, usage = "", False, None, {}
+                elif step.get("type") == "agent-inference":
+                    parts = step.get("value") if isinstance(step.get("value"), list) else []
+                    text = "".join(str(p.get("content") or "") for p in parts
+                                   if isinstance(p, dict) and p.get("type") == "text")
+                    finished = bool(step.get("finishedAt"))
+                    out = step.get("outputTokens")
+                    usage = {}
+                    for _uf in ("inputTokens", "outputTokens", "cachedTokensRead", "cachedTokensCreated"):
+                        _uv = step.get(_uf)
+                        if isinstance(_uv, (int, float)) and not isinstance(_uv, bool):
+                            usage[_uf] = int(_uv)
+        if text.strip() and exclude and text.strip() in exclude:
+            text = ""
+        return text, finished, running, out, usage
+
+    def _hedged_recover(self, transcript, tid, meta, exclude, eff) -> str:
+        import threading as _th
+        import uuid as _uuid
+        chain = [e.strip() for e in os.getenv("NOTION_HEDGE_EFFORT", "high,medium").split(",") if e.strip()] or ["high"]
+        hedge_eff = ",".join(chain)
+        wait = float(os.getenv("NOTION_HEDGE_WAIT", "600") or 600)
+        t0 = time.time()
+        end = t0 + wait
+        base = meta.get("_hedge_transcript") or transcript
+
+        def fresh(effort):
+            out = []
+            for b in base:
+                if isinstance(b, dict) and "id" in b:
+                    b = dict(b, id=str(_uuid.uuid4()))
+                if isinstance(b, dict) and b.get("type") == "config" and isinstance(b.get("value"), dict):
+                    b = {**b, "value": {**b["value"], "reasoningEffort": effort}}
+                out.append(b)
+            return out
+
+        st = {"text": "", "done": False, "account": None, "effort": None, "usage": {}}
+        hmeta = {"_deadline": end, "_hard_end": end, "_is_hedge": True}
+
+        def run():
+            from app.account_pool import is_exhausted as _exh
+            pool = getattr(self, "_pool", None)
+            avoid = {getattr(self, "account_key", "")}
+            fast_fail_s = float(os.getenv("NOTION_SILENT_CLOSE_MIN", "40") or 40)
+            try:
+                for effort in chain:
+                    st["effort"] = effort
+                    for _try in range(2):
+                        if hmeta.get("_cancelled") or time.time() > end - 60:
+                            return
+                        c = self
+                        if pool is not None:
+                            try:
+                                c = pool.get_client(wait_if_cooling=False, avoid=avoid)
+                            except Exception:
+                                return  # every account cooling: nothing to hedge on
+                            if _exh(c) or (getattr(c, "account_key", "") in avoid and c is not self):
+                                return  # only exhausted / already-failed accounts left
+                        st["account"] = getattr(c, "account_key", "")
+                        hmeta.pop("thread_id", None)
+                        hmeta.pop("_silent_close_exc", None)
+                        buf = []
+                        ts = time.time()
+                        failed = None
+                        try:
+                            for it in c._stream_response_once(fresh(effort), thread_id=None, meta=hmeta):
+                                if hmeta.get("_cancelled"):
+                                    return
+                                if isinstance(it, dict) and it.get("type") == "usage":
+                                    for _k, _v in (it.get("usage") or {}).items():
+                                        if isinstance(_v, (int, float)) and not isinstance(_v, bool):
+                                            st["usage"][_k] = st["usage"].get(_k, 0) + int(_v)
+                                    continue
+                                if isinstance(it, dict) and it.get("type") == "content":
+                                    buf.append(str(it.get("text") or ""))
+                        except Exception as exc:
+                            failed = exc
+                        if "".join(buf).strip():
+                            st["text"] = "".join(buf)
+                            return
+                        quick = failed is not None and time.time() - ts < fast_fail_s
+                        logger.info("Effort hedge attempt failed", extra={"request_info": {
+                            "event": "effort_hedge_attempt_failed", "account": st["account"], "effort": effort,
+                            "quick": quick, "after_s": round(time.time() - ts),
+                            "error": str(failed)[:160] if failed else "no text"}})
+                        if quick:
+                            # dead/limited account: report it (usage monitor lookup) and try another
+                            if pool is not None and c is not self:
+                                try:
+                                    pool.mark_failed(c)
+                                except Exception:
+                                    pass
+                            avoid.add(st["account"])
+                            continue
+                        break  # slow empty / capped at this effort: step down the chain
+            finally:
+                st["done"] = True
+
+        logger.info("Silent high-effort inference: starting lower-effort hedge", extra={"request_info": {
+            "event": "effort_hedge_start", "effort": eff, "hedge_effort": hedge_eff, "thread_id": tid,
+            "account": getattr(self, "account_key", "")}})
+        worker = _th.Thread(target=run, name="effort-hedge", daemon=True)
+        worker.start()
+        orig_dead = False
+        polls = 0
+        result, winner, out = "", "none", None
+        try:
+            while time.time() < end:
+                if meta.get("_cancelled"):
+                    winner = "cancelled"
+                    break
+                if st["text"]:
+                    result, winner = st["text"], "hedge"
+                    break
+                if not orig_dead and (polls == 0 or time.time() - t0 > polls * 6):
+                    polls += 1
+                    try:
+                        text, fin, running, out, orig_usage = self._thread_inference_state(tid, exclude)
+                        if orig_usage:
+                            st["orig_usage"] = dict(orig_usage)
+                        elif isinstance(out, int):
+                            st["orig_usage"] = {"outputTokens": int(out)}
+                        if text.strip() and (fin or not running):
+                            result, winner = text, "original"
+                            break
+                        if fin and not text.strip():
+                            orig_dead = True  # hit Notion's output cap while thinking
+                            logger.info("Original inference ended without text (output cap)", extra={
+                                "request_info": {"event": "effort_original_capped", "effort": eff,
+                                                 "output_tokens": out, "after_s": round(time.time() - t0)}})
+                    except Exception as exc:
+                        logger.warning(f"hedge poll failed: {exc}")
+                if orig_dead and st["done"]:
+                    break
+                time.sleep(2)
+        finally:
+            hmeta["_cancelled"] = True
+        try:
+            from app.request_log import annotate_meta
+            from app import cap_memory
+            annotate_meta(meta, hedge_winner=winner, hedge_effort=st["effort"] if winner == "hedge" else hedge_eff,
+                          notion_output_tokens=out if isinstance(out, int) else None)
+            # Bill actual Notion burn: original Max/xhigh attempt + hedge attempt(s).
+            # Downstream (new-api/sub2api) charges from the usage we return; winner-only under-bills.
+            billed = {}
+            for part in (st.get("orig_usage") or {}, st.get("usage") or {}):
+                for _k, _v in part.items():
+                    if isinstance(_v, (int, float)) and not isinstance(_v, bool):
+                        billed[_k] = billed.get(_k, 0) + int(_v)
+            if billed:
+                meta["_rec_usage"] = billed
+                if "outputTokens" in billed:
+                    meta["_rec_out"] = billed["outputTokens"]
+            if winner in ("hedge", "none") or orig_dead:
+                cap_memory.mark(meta.get("_conv_keys"), reason=f"hedge:{winner}")
+                prev = (meta.get("_rl") or {}).get("cap_memory")
+                annotate_meta(meta, cap_memory=prev if prev in ("forced_high", "probe", "autoroute") else "marked")
+        except Exception:
+            pass
+        logger.info("Effort hedge finished", extra={"request_info": {
+            "event": "effort_hedge_done", "winner": winner, "effort": eff, "hedge_effort": hedge_eff,
+            "hedge_account": st["account"], "chars": len(result), "polls": polls,
+            "elapsed_s": round(time.time() - t0)}})
+        return result
+
+    def _poll_thread_inference(self, thread_id: str, req_deadline=None, exclude=None, cancel=None) -> str:
         max_wait = float(os.getenv("NOTION_THREAD_POLL_MAX", "240") or 0)
         if max_wait <= 0:
             return ""
         deadline = time.time() + max_wait
+        if req_deadline:  # never poll past the whole request's budget
+            deadline = min(deadline, req_deadline)
         polls = 0
         while time.time() < deadline:
+            if isinstance(cancel, dict) and cancel.get("_cancelled"):
+                break
             polls += 1
             try:
                 st, b = self.api_post("syncRecordValuesMain", {"requests": [
@@ -579,20 +912,27 @@ class NotionOpusAPI:
                         {"pointer": {"table": "thread_message", "id": m, "spaceId": self.space_id}, "version": -1}
                         for m in msgs[-6:]]}, timeout=15)
                     recs = ((b or {}).get("recordMap") or {}).get("thread_message") or {}
+                    # only an inference AFTER the last user turn is this request's answer; the
+                    # thread also holds the history we replayed (e.g. the previous <tool_call>),
+                    # which must never be returned as the new reply
                     for m in msgs[-6:]:
                         v = (recs.get(m) or {}).get("value", {})
                         v = v.get("value", v) if isinstance(v, dict) else {}
                         step = v.get("step") or {}
-                        if step.get("type") == "agent-inference":
+                        if step.get("type") == "user":
+                            text, finished = "", False
+                        elif step.get("type") == "agent-inference":
                             parts = step.get("value") if isinstance(step.get("value"), list) else []
                             text = "".join(str(p.get("content") or "") for p in parts
                                            if isinstance(p, dict) and p.get("type") == "text")
                             finished = bool(step.get("finishedAt"))
+                if text.strip() and exclude and text.strip() in exclude:
+                    text = ""  # replayed history turn, not a new answer
                 if text.strip() and (finished or not running):
                     logger.info("Recovered inference from thread record", extra={"request_info": {
                         "event": "notion_thread_recovered", "polls": polls, "chars": len(text)}})
                     return text
-                if not running and polls > 2 and not text:
+                if not running and polls > 1 and not text:  # nothing after the last user turn and idle
                     break
             except Exception as exc:
                 logger.warning(f"thread poll failed: {exc}")
@@ -607,6 +947,15 @@ class NotionOpusAPI:
         ids, then give up and surface the error."""
         import uuid as _uuid
         delays = [float(x) for x in os.getenv("NOTION_RATE_LIMIT_BACKOFF", "6,15").split(",") if x.strip()]
+        pool = getattr(self, "_pool", None)
+        try:
+            other = bool(pool is not None and pool.other_free(self))
+        except Exception:
+            other = False
+        if other:
+            # another account can take the request now: one short backoff at most, none if
+            # this account already failed recently (sustained fair-use throttle)
+            delays = [] if getattr(self, "fail_streak", 0) else delays[:1]
         src = first_src
         for attempt in range(len(delays) + 1):
             got_any = False
@@ -691,6 +1040,9 @@ class NotionOpusAPI:
 
         # 保存 thread_id 以便外部访问
         self.current_thread_id = thread_id
+        if should_create_thread:
+            from app import thread_janitor as _tj
+            _tj.record(thread_id, self.account_key)
         if meta is not None:
             meta["thread_id"] = thread_id
             meta["account"] = self.account_key
@@ -808,11 +1160,14 @@ class NotionOpusAPI:
                     stream=True,
                     timeout=(15, 120),
                 )
+            if meta is not None:
+                meta["_http_response"] = response  # lets a disconnect handler abort the read
             if response.status_code != 200:
                 excerpt = (response.text or "").strip().replace("\n", " ")[:300]
                 self._note_quota(response.status_code, excerpt)
                 # 429 和 5xx 都允许重试（换账号或等待后重试）
-                retriable = response.status_code >= 500 or response.status_code == 429
+                # 401: this account's token is dead (marked unusable above) -> another account may work
+                retriable = response.status_code >= 500 or response.status_code in (429, 401)
                 raise NotionUpstreamError(
                     f"Notion upstream returned HTTP {response.status_code}.",
                     status_code=response.status_code,
@@ -862,7 +1217,11 @@ class NotionOpusAPI:
             logger.error(f"Request timeout: {exc}", exc_info=True)
             raise NotionUpstreamError("Request to Notion upstream timed out.", retriable=True) from exc
         except requests.exceptions.RequestException as exc:
-            logger.error(f"Request failed: {exc}", exc_info=True)
+            if isinstance(meta, dict) and meta.get("_cancelled"):
+                logger.info("Notion stream closed after client disconnect",
+                            extra={"request_info": {"event": "upstream_closed_on_disconnect"}})
+            else:
+                logger.error(f"Request failed: {exc}", exc_info=True)
             # 不暴露原始异常细节给用户
             raise NotionUpstreamError("Request to Notion upstream failed. Please try again later.", retriable=True) from exc
         finally:

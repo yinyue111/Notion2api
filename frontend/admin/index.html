@@ -9,33 +9,36 @@
 <body>
 <div id="login-view" class="login-wrap hidden">
   <form id="login-form" class="login-card" autocomplete="on">
-    <div class="brand big">Notion2API</div>
-    <p class="muted">管理面板登录</p>
-    <label>用户名<input id="lu" name="username" autocomplete="username" required></label>
-    <label>密码<input id="lp" name="password" type="password" autocomplete="current-password" required></label>
+    <div class="brand big"><span class="brand-mark">N</span><span class="brand-text">Notion2API</span></div>
+    <div class="login-title">欢迎回来</div>
+    <p class="muted small login-sub">登录管理面板以继续</p>
+    <label>用户名<input id="lu" name="username" autocomplete="username" required placeholder="管理员用户名"></label>
+    <label>密码<input id="lp" name="password" type="password" autocomplete="current-password" required placeholder="密码"></label>
     <button type="submit" class="btn primary">登录</button>
     <div id="login-err" class="err"></div>
+    <div class="login-foot">Notion AI → OpenAI 兼容网关</div>
   </form>
 </div>
 
 <div id="app-view" class="layout hidden">
   <aside class="sidebar">
-    <div class="brand">Notion2API</div>
+    <div class="brand"><span class="brand-mark">N</span><span class="brand-text">Notion2API</span></div>
     <nav>
-      <a data-page="overview" href="#overview">📊 概览</a>
-      <a data-page="accounts" href="#accounts">👤 账号</a>
-      <a data-page="requests" href="#requests">📜 请求与用量</a>
-      <a data-page="chat" href="#chat">💬 对话</a>
+      <a data-page="overview" href="#overview"><span class="nav-ico">📊</span><span>概览</span></a>
+      <a data-page="accounts" href="#accounts"><span class="nav-ico">👤</span><span>账号</span></a>
+      <a data-page="requests" href="#requests"><span class="nav-ico">📜</span><span>请求与用量</span></a>
+      <a data-page="chat" href="#chat"><span class="nav-ico">💬</span><span>对话</span></a>
     </nav>
     <div class="side-foot">
       <div id="who" class="muted small"></div>
-      <button id="theme-btn" class="btn ghost small">🌓 主题</button>
-      <button id="logout-btn" class="btn ghost small">退出登录</button>
+      <button id="theme-btn" class="btn ghost small" type="button">🌓 主题</button>
+      <button id="logout-btn" class="btn ghost small" type="button">退出登录</button>
     </div>
   </aside>
   <main>
     <section id="page-overview" class="page">
       <h1>概览</h1>
+      <p class="page-sub">账号池状态、近 24 小时 / 7 天用量与最近错误</p>
       <div id="ov-cards" class="cards"></div>
       <h2>近 7 天</h2>
       <div class="table-wrap"><table id="ov-days"></table></div>
@@ -44,13 +47,33 @@
     </section>
 
     <section id="page-accounts" class="page">
-      <div class="page-head"><h1>Notion 账号</h1><button id="add-acc-btn" class="btn primary">＋ 添加账号</button></div>
-      <p class="muted small">token_v2 只写不读，仅显示末 4 位；修改后账号池即时热更新。测试 30 秒/次、额度 60 秒/次限流。</p>
+      <div class="page-head">
+        <div>
+          <h1>Notion 账号</h1>
+          <p class="page-sub" style="margin-bottom:0">邮箱验证码登录或手动粘贴 token；修改后账号池即时热更新</p>
+        </div>
+        <div class="actions">
+          <button id="nl-btn" class="btn primary" type="button">📧 登录 Notion 账号</button>
+          <button id="add-acc-btn" class="btn" type="button">＋ 手动粘贴 token</button>
+        </div>
+      </div>
+      <div class="hint-banner">token_v2 只写不读，仅显示末 4 位。测试 30 秒/次、额度 60 秒/次限流。</div>
       <div class="table-wrap"><table id="acc-table"></table></div>
+      <div class="page-head" style="margin-top:28px">
+        <h2>额度与预估 <span class="muted small">（6h 滚动 / 月度 %，$ 按 Opus 官方价估算）</span></h2>
+        <button id="q-refresh" class="btn small" type="button">刷新额度（只读，不耗模型）</button>
+      </div>
+      <div id="q-cards" class="cards"></div>
+      <div class="table-wrap"><table id="q-table"></table></div>
+      <p id="q-note" class="muted small"></p>
     </section>
 
     <section id="page-requests" class="page">
-      <div class="page-head"><h1>请求与用量</h1>
+      <div class="page-head">
+        <div>
+          <h1>请求与用量</h1>
+          <p class="page-sub" style="margin-bottom:0">按模型 / 账号 / 天汇总，以及请求日志元数据</p>
+        </div>
         <select id="st-days"><option value="1">24 小时</option><option value="7" selected>7 天</option><option value="30">30 天</option></select>
       </div>
       <div id="st-cards" class="cards"></div>
@@ -59,15 +82,16 @@
         <div><h2>按账号</h2><div class="table-wrap"><table id="st-account"></table></div></div>
       </div>
       <h2>按天</h2><div class="table-wrap"><table id="st-day"></table></div>
-      <div class="page-head"><h2>请求日志 <span class="muted small">（仅元数据，保留 30 天）</span></h2>
+      <div class="page-head">
+        <h2>请求日志 <span class="muted small">（仅元数据，保留 30 天）</span></h2>
         <div class="filters">
           <select id="rq-status"><option value="">全部</option><option value="ok">成功</option><option value="error">错误</option></select>
           <input id="rq-model" placeholder="模型">
-          <button id="rq-refresh" class="btn small">刷新</button>
+          <button id="rq-refresh" class="btn small" type="button">刷新</button>
         </div>
       </div>
       <div class="table-wrap"><table id="rq-table"></table></div>
-      <div class="pager"><button id="rq-prev" class="btn small">上一页</button><span id="rq-info" class="muted small"></span><button id="rq-next" class="btn small">下一页</button></div>
+      <div class="pager"><button id="rq-prev" class="btn small" type="button">上一页</button><span id="rq-info" class="muted small"></span><button id="rq-next" class="btn small" type="button">下一页</button></div>
     </section>
 
     <section id="page-chat" class="page page-chat">
@@ -79,13 +103,33 @@
 <dialog id="acc-dialog">
   <form id="acc-form" method="dialog">
     <h2 id="acc-dialog-title">添加账号</h2>
-    <label>备注名<input name="label" maxlength="200"></label>
-    <label class="tok">token_v2<input name="token_v2" type="password" autocomplete="off" maxlength="4000"></label>
+    <p class="muted small hint">手动粘贴 token_v2；space_id / user_id 仅新建时需要。</p>
+    <label>备注名<input name="label" maxlength="200" placeholder="例如：主账号"></label>
+    <label class="tok">token_v2<input name="token_v2" type="password" autocomplete="off" maxlength="4000" placeholder="token_v2=…"></label>
     <label class="new-only">space_id<input name="space_id" maxlength="100"></label>
     <label class="new-only">user_id<input name="user_id" maxlength="100"></label>
-    <label>邮箱（可选）<input name="user_email" maxlength="200"></label>
+    <label>邮箱（可选）<input name="user_email" maxlength="200" type="email" placeholder="user@example.com"></label>
     <div class="err" id="acc-err"></div>
-    <div class="row-end"><button value="cancel" class="btn ghost" formnovalidate>取消</button><button id="acc-save" value="ok" class="btn primary">保存</button></div>
+    <div class="row-end"><button value="cancel" class="btn ghost" formnovalidate type="submit">取消</button><button id="acc-save" value="ok" class="btn primary" type="submit">保存</button></div>
+  </form>
+</dialog>
+<dialog id="nl-dialog">
+  <form id="nl-form" method="dialog">
+    <h2>登录 Notion 账号</h2>
+    <p class="muted small hint">网关代你向 Notion 发起邮箱验证码登录：Notion 会给该邮箱发一封含登录码的邮件，填入后网关在服务端完成登录并自动捕获 token_v2（加密入库，不回显、不写日志）。同 workspace 的已有账号会直接刷新 token。</p>
+    <div id="nl-step1">
+      <label>Notion 邮箱<input name="email" type="email" autocomplete="off" maxlength="254" placeholder="you@company.com"></label>
+      <label>备注名（可选）<input name="label" maxlength="200" placeholder="例如：公司 workspace"></label>
+    </div>
+    <div id="nl-step2" class="hidden">
+      <p class="small">验证码已发送到 <b id="nl-email"></b>，10 分钟内有效。</p>
+      <label>邮件中的登录码<input name="code" autocomplete="one-time-code" maxlength="64" placeholder="登录码"></label>
+    </div>
+    <div id="nl-step3" class="hidden">
+      <label>选择 workspace<select name="space"></select></label>
+    </div>
+    <div class="err" id="nl-err"></div>
+    <div class="row-end"><button id="nl-cancel" value="cancel" class="btn ghost" formnovalidate type="submit">取消</button><button id="nl-next" class="btn primary" type="button">发送验证码</button></div>
   </form>
 </dialog>
 <div id="toast"></div>

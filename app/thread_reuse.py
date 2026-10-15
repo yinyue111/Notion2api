@@ -102,10 +102,60 @@ def normalize_history(messages: list[dict]) -> list[dict]:
     return out
 
 
+# Claude Code / Claude Desktop (Agent SDK) prepend a per-request billing block to the system
+# prompt ("x-anthropic-billing-header: cc_version=..; cc_entrypoint=..; cch=<per-request>;");
+# new-api concatenates the system blocks, so it lands at the start of the system message.
+_VOLATILE_SYS_RE = re.compile(r"x-anthropic-billing-header:[^\n]*?(?:[\w.-]+=[^;\n]*;\s*)+", re.I)
+
+
+def sys_text(v: Any) -> str:
+    """System content as plain text with volatile per-request metadata removed."""
+    if isinstance(v, list):
+        v = "\n".join(str(p.get("text") or "") for p in v if isinstance(p, dict))
+    if not isinstance(v, str):
+        v = "" if v is None else str(v)
+    return _VOLATILE_SYS_RE.sub("", v)
+
+
+def _line_hash(line: str) -> str:
+    return hashlib.sha256(line.encode()).hexdigest()[:10]
+
+
+def sys_lines(messages: list[dict]) -> list[str]:
+    """Normalised non-empty lines of all system/developer messages."""
+    out = []
+    for m in messages or []:
+        if isinstance(m, dict) and m.get("role") in ("system", "developer"):
+            for ln in sys_text(m.get("content")).splitlines():
+                ln = " ".join(ln.split())
+                if ln:
+                    out.append(ln)
+    return out
+
+
+def sys_delta(messages: list[dict], stored_hashes: list[str]) -> str:
+    """Lines of the current system prompt the continued thread has not seen yet (hash set
+    stored with the entry) -> a dynamic system prompt (date, memory, project context, env)
+    is sent as a small update instead of breaking reuse or being silently dropped."""
+    if not stored_hashes:
+        return ""
+    seen, new = set(stored_hashes), []
+    for ln in sys_lines(messages):
+        h = _line_hash(ln)
+        if h not in seen:
+            seen.add(h)
+            new.append(ln)
+    return "\n".join(new)
+
+
+def tp_hash(tool_prompt: str) -> str:
+    return hashlib.sha256((tool_prompt or "").encode()).hexdigest()[:16] if tool_prompt else ""
+
+
 def canon(m: dict) -> list:
     role = m.get("role")
     if role in ("system", "developer"):
-        return ["s", _visible(m.get("content"))]
+        return ["s", _norm_text(sys_text(m.get("content")))]
     if role == "user":
         return ["u", _visible(m.get("content"))]
     if role == "assistant":
@@ -157,10 +207,12 @@ def identity(headers, user: str | None) -> tuple[str, list[str]]:
     return "\x01".join(parts), srcs
 
 
-def namespace(model: str, tool_prompt: str, ident: str = "") -> str:
-    """Model is deliberately NOT part of the key: a Notion thread accepts any model per
-    turn, and agents switch models mid-conversation."""
-    return hashlib.sha256(f"{ident}\x00{tool_prompt}".encode()).hexdigest()
+def namespace(model: str, tool_prompt: str = "", ident: str = "") -> str:
+    """Caller identity only. Model is NOT part of the key (a Notion thread accepts any model
+    per turn; agents switch models), and neither is the tool list: MCP clients (Claude
+    Desktop) change it when connectors/deferred tools load. The tool-prompt hash is stored
+    per entry instead; a changed list is re-sent on the continued thread."""
+    return hashlib.sha256(f"{ident}\x00".encode()).hexdigest()
 
 
 def chain(ns: str, messages: list[dict]) -> list[str]:
@@ -211,6 +263,10 @@ class ThreadReuseStore:
         c = sqlite3.connect(self._db, timeout=5)
         c.execute("CREATE TABLE IF NOT EXISTS thread_reuse (k TEXT PRIMARY KEY, loose TEXT, ns TEXT, thread_id TEXT,"
                   " account TEXT, ts REAL, n INTEGER, mh TEXT)")
+        cols = [r[1] for r in c.execute("PRAGMA table_info(thread_reuse)")]
+        for col, typ in (("sh", "TEXT"), ("tp", "TEXT"), ("pt", "INTEGER")):
+            if col not in cols:
+                c.execute(f"ALTER TABLE thread_reuse ADD COLUMN {col} {typ}")
         return c
 
     def _load(self) -> None:
@@ -222,14 +278,15 @@ class ThreadReuseStore:
             return
         try:
             c = self._conn()
-            rows = c.execute("SELECT k, loose, ns, thread_id, account, ts, n, mh FROM thread_reuse ORDER BY ts").fetchall()
+            rows = c.execute("SELECT k, loose, ns, thread_id, account, ts, n, mh, sh, tp, pt FROM thread_reuse ORDER BY ts").fetchall()
             c.close()
         except Exception:
             self._db = ""
             return
-        for k, loose, ns, tid, acc, ts, n, mh in rows:
+        for k, loose, ns, tid, acc, ts, n, mh, sh, tp, pt in rows:
             e = {"thread_id": tid, "account": acc, "ts": ts, "n": n, "ns": ns, "loose": loose,
-                 "mh": (mh or "").split(",") if mh else []}
+                 "mh": (mh or "").split(",") if mh else [], "sh": (sh or "").split(",") if sh else [],
+                 "tp": tp or "", "pt": pt}
             self._d[k] = e
             if loose:
                 self._loose[loose] = k
@@ -288,23 +345,34 @@ class ThreadReuseStore:
                 if key is None:
                     continue
                 if accept is not None:
-                    why = accept(k)
+                    try:
+                        why = accept(k, self._d[key])
+                    except TypeError:
+                        why = accept(k)
                     if why:
                         vetoed = vetoed or why
                         continue
                 e = self._drop(key)
+                if e is not None:
+                    e["_k"] = key
                 return e, k, how
         return None, 0, vetoed or "nomatch"
 
-    def put(self, ns: str, messages: list[dict], reply: dict, thread_id: str, account: str) -> None:
+    def put(self, ns: str, messages: list[dict], reply: dict, thread_id: str, account: str,
+            tool_prompt: str = "", prompt_tokens=None) -> None:
         if not thread_id or not account:
             return
         full = normalize_history(list(messages) + [reply])
         key = chain(ns, full)[-1]
         loose = loose_chain(ns, full)[-1] if _loose_on() else ""
         mh = [msg_hash(m) for m in full][-400:]
+        sh = list(dict.fromkeys(_line_hash(ln) for ln in sys_lines(full)))[-3000:]
+        try:
+            pt = int(prompt_tokens) if prompt_tokens is not None else None
+        except (TypeError, ValueError):
+            pt = None
         e = {"thread_id": thread_id, "account": account, "ts": time.time(), "n": len(full), "ns": ns[:16],
-             "loose": loose, "mh": mh}
+             "loose": loose, "mh": mh, "sh": sh, "tp": tp_hash(tool_prompt), "pt": pt}
         with self._lock:
             self._load()
             self._d[key] = e
@@ -312,9 +380,34 @@ class ThreadReuseStore:
             if loose:
                 self._loose[loose] = key
             self.stats["stored"] += 1
-            self._db_exec("INSERT OR REPLACE INTO thread_reuse VALUES (?,?,?,?,?,?,?,?)",
-                          (key, loose, e["ns"], thread_id, account, e["ts"], e["n"], ",".join(mh)))
+            self._db_exec("INSERT OR REPLACE INTO thread_reuse (k, loose, ns, thread_id, account, ts, n, mh, sh, tp, pt)"
+                          " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                          (key, loose, e["ns"], thread_id, account, e["ts"], e["n"], ",".join(mh), ",".join(sh), e["tp"], pt))
             self._gc(time.time())
+
+    def restore(self, e: Optional[dict]) -> bool:
+        """Put back an entry taken by take() whose continuation was rejected upstream
+        (429/503 before any output: Notion appended nothing to the thread), so the
+        client's retry of the same request still continues the thread. Keeps the
+        original ts; never overwrites a newer entry with the same key."""
+        if not e or not e.get("_k"):
+            return False
+        key = e["_k"]
+        with self._lock:
+            self._load()
+            if key in self._d:
+                return False
+            e = {k: v for k, v in e.items() if k != "_k"}
+            self._d[key] = e
+            if e.get("loose"):
+                self._loose[e["loose"]] = key
+            self.stats["restored"] = self.stats.get("restored", 0) + 1
+            self._db_exec("INSERT OR REPLACE INTO thread_reuse (k, loose, ns, thread_id, account, ts, n, mh, sh, tp, pt)"
+                          " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                          (key, e.get("loose") or "", e.get("ns") or "", e["thread_id"], e["account"], e["ts"],
+                           e.get("n"), ",".join(e.get("mh") or []), ",".join(e.get("sh") or []), e.get("tp") or "",
+                           e.get("pt")))
+        return True
 
     def diagnose(self, ns: str, messages: list[dict]) -> dict:
         """Miss diagnostics (hashes only): role sequence, per-message hash prefixes, and the

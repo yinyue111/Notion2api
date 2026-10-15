@@ -11,6 +11,7 @@ class ChatMessage(BaseModel):
     role: Literal["user", "assistant", "system", "developer", "tool", "function"]
     content: str = ""
     thinking: Optional[str] = None
+    reasoning_content: Optional[str] = None
     # OpenAI function-calling fields (emulated, see app/tool_emulation.py)
     tool_calls: Optional[List[Dict[str, Any]]] = None
     tool_call_id: Optional[str] = None

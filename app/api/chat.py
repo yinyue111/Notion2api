@@ -1,5 +1,4 @@
 import os
-import os
 import asyncio
 import json
 import re
@@ -10,6 +9,7 @@ from typing import Any, Dict, Generator, Iterable, List, Tuple
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool as _rtp
 
 from app.config import is_lite_mode
 from app.conversation import (
@@ -795,6 +795,8 @@ def _create_standard_stream_generator(
     authoritative_final_source_type = ""
     assistant_started = False
     is_web_client = client_type == "web"
+    aborted = False  # client went away: emit nothing more, stop the upstream
+    stream_exc: BaseException | None = None
 
     try:
         for raw_item in _iter_stream_items(first_item, stream_gen):
@@ -868,7 +870,8 @@ def _create_standard_stream_generator(
                 )
             else:
                 yield _build_stream_chunk(response_id, model_name, content=chunk_text)
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, GeneratorExit):
+        aborted = True
         logger.info(
             "Standard streaming cancelled by client",
             extra={"request_info": {"event": "standard_stream_cancelled"}},
@@ -876,6 +879,7 @@ def _create_standard_stream_generator(
         raise
     except BaseException as exc:
         if _is_client_disconnect_error(exc):
+            aborted = True
             logger.info(
                 "Standard streaming connection closed by client",
                 extra={
@@ -888,6 +892,10 @@ def _create_standard_stream_generator(
             exc_info=True,
             extra={"request_info": {"event": "standard_stream_interrupted"}},
         )
+        stream_exc = exc
+        if not streamed_content_accumulator.strip() and not authoritative_final_content:
+            # nothing usable was sent: a proper error event (below), not an error-text "answer"
+            return
         error_hint = _stream_error_hint(exc)
         streamed_content_accumulator += error_hint
         if not assistant_started:
@@ -901,84 +909,109 @@ def _create_standard_stream_generator(
         else:
             yield _build_stream_chunk(response_id, model_name, content=error_hint)
     finally:
-        # 选择最佳最终回复
-        final_reply, _ = _select_best_final_reply(
-            streamed_content_accumulator,
-            authoritative_final_content,
-            authoritative_final_source_type,
-        )
+      if aborted:
+        try:
+            stream_gen.close()  # stop the Notion stream so the account isn't kept busy
+        except Exception:
+            pass
+      else:
+          # 选择最佳最终回复
+          final_reply, _ = _select_best_final_reply(
+              streamed_content_accumulator,
+              authoritative_final_content,
+              authoritative_final_source_type,
+          )
 
-        # 发送缺失的后缀（如果有）
-        missing_suffix = _compute_missing_suffix(
-            streamed_content_accumulator, final_reply
-        )
-        if missing_suffix:
-            if not assistant_started:
-                assistant_started = True
-                yield _build_stream_chunk(
-                    response_id,
-                    model_name,
-                    role="assistant",
-                    content=missing_suffix,
-                )
-            else:
-                yield _build_stream_chunk(
-                    response_id, model_name, content=missing_suffix
-                )
-            streamed_content_accumulator += missing_suffix
-        elif final_reply != streamed_content_accumulator:
-            # 处理分叉内容（使用最终内容）
-            if not streamed_content_accumulator and final_reply:
-                if not assistant_started:
-                    assistant_started = True
-                    yield _build_stream_chunk(
-                        response_id,
-                        model_name,
-                        role="assistant",
-                        content=final_reply,
-                    )
-                else:
-                    yield _build_stream_chunk(
-                        response_id, model_name, content=final_reply
-                    )
-                streamed_content_accumulator = final_reply
+          # 发送缺失的后缀（如果有）
+          missing_suffix = _compute_missing_suffix(
+              streamed_content_accumulator, final_reply
+          )
+          if missing_suffix:
+              if not assistant_started:
+                  assistant_started = True
+                  yield _build_stream_chunk(
+                      response_id,
+                      model_name,
+                      role="assistant",
+                      content=missing_suffix,
+                  )
+              else:
+                  yield _build_stream_chunk(
+                      response_id, model_name, content=missing_suffix
+                  )
+              streamed_content_accumulator += missing_suffix
+          elif final_reply != streamed_content_accumulator:
+              # 处理分叉内容（使用最终内容）
+              if not streamed_content_accumulator and final_reply:
+                  if not assistant_started:
+                      assistant_started = True
+                      yield _build_stream_chunk(
+                          response_id,
+                          model_name,
+                          role="assistant",
+                          content=final_reply,
+                      )
+                  else:
+                      yield _build_stream_chunk(
+                          response_id, model_name, content=final_reply
+                      )
+                  streamed_content_accumulator = final_reply
 
-        # 输出搜索结果
-        if collected_search_sources or collected_search_queries:
-            search_payload = {
-                "queries": collected_search_queries,
-                "sources": collected_search_sources,
-            }
-            if is_web_client:
-                # Web UI：扩展 search_metadata（带 OpenAI chunk 外壳）
-                yield _build_local_ui_chunk(
-                    response_id,
-                    model_name,
-                    "search_metadata",
-                    searches=search_payload,
-                )
-            else:
-                # 严格客户端：markdown 注入 content，不丢结果
-                search_md = _format_search_results_md(search_payload)
-                if search_md:
-                    if not assistant_started:
-                        assistant_started = True
-                        yield _build_stream_chunk(
-                            response_id,
-                            model_name,
-                            role="assistant",
-                            content=search_md,
-                        )
-                    else:
-                        yield _build_stream_chunk(
-                            response_id, model_name, content=search_md
-                        )
+          # 输出搜索结果
+          if collected_search_sources or collected_search_queries:
+              search_payload = {
+                  "queries": collected_search_queries,
+                  "sources": collected_search_sources,
+              }
+              if is_web_client:
+                  # Web UI：扩展 search_metadata（带 OpenAI chunk 外壳）
+                  yield _build_local_ui_chunk(
+                      response_id,
+                      model_name,
+                      "search_metadata",
+                      searches=search_payload,
+                  )
+              else:
+                  # 严格客户端：markdown 注入 content，不丢结果
+                  search_md = _format_search_results_md(search_payload)
+                  if search_md:
+                      if not assistant_started:
+                          assistant_started = True
+                          yield _build_stream_chunk(
+                              response_id,
+                              model_name,
+                              role="assistant",
+                              content=search_md,
+                          )
+                      else:
+                          yield _build_stream_chunk(
+                              response_id, model_name, content=search_md
+                          )
 
-        yield _build_stream_chunk(response_id, model_name, finish_reason="stop")
-        _usage_chunk = _build_usage_chunk(response_id, model_name, stream_gen)
-        if _usage_chunk:
-            yield _usage_chunk
-        yield "data: [DONE]\n\n"
+          if not streamed_content_accumulator.strip():
+              # nothing to show (error before any text, or Notion closed the stream empty):
+              # an OpenAI-style error event so clients/relays don't take "" as the answer
+              if isinstance(stream_exc, NotionUpstreamError):
+                  info = _classify_upstream_error(stream_exc)
+                  err = {"message": info.get("message"), "type": info.get("type", "upstream_error"),
+                         "code": info.get("code"), "status": info.get("status") or stream_exc.status_code or 502}
+              elif stream_exc is not None:
+                  err = {"message": "Upstream connection interrupted, please retry.", "type": "upstream_error",
+                         "code": "UPSTREAM_INTERRUPTED", "status": 502}
+              else:
+                  err = {"message": "Notion upstream returned empty content, please retry.", "type": "upstream_error",
+                         "code": "EMPTY_CONTENT", "status": 502}
+              logger.warning("Standard stream ended without content", extra={"request_info": {
+                  "event": "standard_stream_empty", "code": err["code"]}})
+              _request_log_annotate(error_code=err["code"], error_message=str(err["message"])[:300])
+              yield f"data: {json.dumps({'error': err}, ensure_ascii=False)}\n\n"
+              yield "data: [DONE]\n\n"
+              return
+          yield _build_stream_chunk(response_id, model_name, finish_reason="stop")
+          _usage_chunk = _build_usage_chunk(response_id, model_name, stream_gen)
+          if _usage_chunk:
+              yield _usage_chunk
+          yield "data: [DONE]\n\n"
 
 
 def _tool_call_chunks(response_id: str, model: str, calls: list, role_needed: bool) -> Generator[str, None, None]:
@@ -1019,7 +1052,27 @@ def _defang_urls(obj):
     return obj
 
 
-def _tick_iter(it, every: float = 5.0):
+def _last_user_ask(messages) -> str:
+    """Text of the client's last message when it is a user turn ("" after tool results)."""
+    try:
+        last = messages[-1] if messages else None
+        role = last.get("role") if isinstance(last, dict) else getattr(last, "role", None)
+        if role != "user":
+            return ""
+        c = last.get("content") if isinstance(last, dict) else getattr(last, "content", None)
+        if isinstance(c, str):
+            return c
+        out = []
+        for part in c or []:
+            p = part if isinstance(part, dict) else getattr(part, "__dict__", {})
+            if p.get("type") in ("text", "input_text") and isinstance(p.get("text"), str):
+                out.append(p["text"])
+        return "\n".join(out)
+    except Exception:
+        return ""
+
+
+def _tick_iter(it, every: float = 5.0, on_stop=None):
     """Yield items from `it`, plus _TICK whenever nothing arrived for `every` seconds.
     The upstream is consumed in a worker thread so ticks flow even while Notion is
     silent (long tool_call generation, backoff sleeps). Closing this generator (client
@@ -1068,8 +1121,51 @@ def _tick_iter(it, every: float = 5.0):
                 raise x
             else:
                 return
+    except GeneratorExit:
+        # consumer gone (client disconnected): don't wait for Notion's next item to notice
+        stop.set()
+        if on_stop is not None:
+            try:
+                on_stop()
+            except Exception:
+                pass
+        raise
     finally:
         stop.set()
+
+
+def _lowered_effort(transcript):
+    """Config block with high/xhigh/max reasoning effort lowered to medium."""
+    out = []
+    for b in transcript:
+        if isinstance(b, dict) and b.get("type") == "config" and isinstance(b.get("value"), dict) \
+                and str(b["value"].get("reasoningEffort") or "").lower() in ("high", "xhigh", "max"):
+            logger.info("Retrying with lower reasoning effort", extra={"request_info": {
+                "event": "effort_lowered", "from": b["value"].get("reasoningEffort"), "to": "medium"}})
+            b = {**b, "value": {**b["value"], "reasoningEffort": "medium"}}
+        out.append(b)
+    return out
+
+
+def _abort_upstream(meta) -> None:
+    """Client went away: flag the request cancelled (stops retries / thread polling) and
+    shut down the in-flight Notion socket so the blocked reader returns now instead of
+    at Notion's next item (which can be 30-60s away while a tool call is generated)."""
+    if not isinstance(meta, dict):
+        return
+    meta["_cancelled"] = True
+    resp = meta.get("_http_response")
+    if resp is None:
+        return
+    import socket as _socket
+    try:
+        fp = getattr(getattr(resp, "raw", None), "_fp", None)
+        sock = getattr(getattr(getattr(fp, "fp", None), "raw", None), "_sock", None)
+        if sock is not None:
+            sock.shutdown(_socket.SHUT_RDWR)
+    except Exception:
+        pass
+    logger.info("Client gone: aborted in-flight Notion stream", extra={"request_info": {"event": "upstream_aborted"}})
 
 
 def _sum_usage(a: dict | None, b: dict | None) -> dict | None:
@@ -1090,25 +1186,52 @@ def _run_tool_attempts(client, transcript, *, include_usage, account, tools, par
     total_raw = None
     collector = None
     result = None
+    budget = float(os.getenv("NOTION_REQUEST_BUDGET", "330") or 0)
+    deadline = time.time() + budget if budget > 0 else None
+    if meta is None:
+        meta = {}
+    meta["_deadline"] = deadline
+    lower_effort = False
+    tried = {getattr(client, "account_key", "")}
     for attempt in range(1, TOOL_MODE_MAX_ATTEMPTS + 1):
+        if meta.get("_cancelled"):
+            return  # client gone: no result
+        if attempt > 1 and deadline and time.time() > deadline - 60:
+            logger.info("Tool mode: request budget exhausted, not retrying", extra={"request_info": {
+                "event": "tool_mode_budget_exhausted", "attempt": attempt, "budget_s": budget}})
+            break
+        if deadline:  # leave room for one failover retry after the first attempt
+            meta["_deadline"] = deadline - 150 if attempt == 1 else deadline
         # fresh block ids per attempt: Notion rejects re-sent ids (400 ValidationError / 502)
-        # a reused (continued) thread is only tried once; retries start a fresh full thread
-        base = transcript if attempt == 1 else (fallback_transcript or transcript)
+        # Same-thread 502 short-retry keeps the continued transcript; other retries use full.
+        _same_keep = bool(meta.get("_same_thread_502_keep"))
+        base = transcript if (attempt == 1 or _same_keep) else (fallback_transcript or transcript)
         attempt_transcript = [dict(b, id=str(uuid.uuid4())) if isinstance(b, dict) and "id" in b else b
                               for b in base] if attempt > 1 else base
-        if attempt > 1 and thread_id and meta is not None:
+        if lower_effort:
+            attempt_transcript = _lowered_effort(attempt_transcript)
+        if attempt > 1 and thread_id and meta is not None and not _same_keep:
             meta["reuse_fallback"] = "retry"
-        collector = _UsageCollector(client.stream_response(attempt_transcript, thread_id=thread_id if attempt == 1 else None,
+            from app.request_log import current_log as _cl, annotate as _rl_annotate
+            if not str((_cl.get() or {}).get("thread_reuse") or "").startswith("hit>"):
+                _rl_annotate(thread_reuse="hit>fallback:retry")  # refusal / empty answer -> fresh thread
+        # Keep the Notion thread across a single 502 short-retry; later fallbacks clear it.
+        _keep_tid = thread_id if (attempt == 1 or meta.get("_same_thread_502_keep")) else None
+        if attempt > 1 and meta.get("_same_thread_502_keep"):
+            meta.pop("_same_thread_502_keep", None)  # consumed for this one retry
+        collector = _UsageCollector(client.stream_response(attempt_transcript, thread_id=_keep_tid,
                                                            meta=meta),
                                     include_usage=include_usage, account=account)
         content, thinking, final_text, final_src = [], [], "", ""
         failed = False
+        got_items = 0
         try:
           try:
-              for raw_item in _tick_iter(collector):
+              for raw_item in _tick_iter(collector, on_stop=lambda m=meta: _abort_upstream(m)):
                   if raw_item is _TICK:
                       yield "tick"
                       continue
+                  got_items += 1
                   item = _normalize_stream_item(raw_item)
                   typ = item.get("type")
                   if typ == "content" and item.get("text"):
@@ -1120,25 +1243,58 @@ def _run_tool_attempts(client, transcript, *, include_usage, account, tools, par
                       if ft:
                           final_text, final_src = ft, str(item.get("source_type", "") or "")
           except NotionUpstreamError as exc:
-              # never re-hit a fair-use rate limit on the same account: fail over to another
-              # free account (fresh full thread) like standard mode, else surface it
-              if exc.status_code in (429, 503):
-                  if not (pool is not None and attempt < TOOL_MODE_MAX_ATTEMPTS
-                          and _other_account_free(pool, client)):
+              # Empty-stream 502 on a continued thread: short-retry SAME thread once before
+              # opening a new/fallback thread (preserves Notion prompt cache).
+              same_tid_retry = (
+                  exc.retriable and (exc.status_code or 0) == 502 and thread_id
+                  and not meta.get("_same_thread_502_retried") and not got_items
+                  and not meta.get("_cancelled")
+              )
+              if same_tid_retry:
+                  meta["_same_thread_502_retried"] = True
+                  meta["_same_thread_502_keep"] = True
+                  from app.request_log import annotate as _rl_annotate
+                  _rl_annotate(thread_reuse="hit>retry502")
+                  logger.info("Tool mode: 502 on continued thread, short-retry same thread",
+                              extra={"request_info": {"event": "tool_mode_same_thread_502_retry",
+                                                      "thread_id": thread_id, "attempt": attempt}})
+                  failed = True
+              else:
+                  if thread_id and meta is not None and (
+                          attempt == 1 or meta.get("_same_thread_502_retried")):
+                      from app.request_log import annotate as _rl_annotate
+                      from app import thread_reuse as _tr
+                      # the continued thread failed: report the real outcome, and if Notion
+                      # rejected the turn (rate limit) keep the entry for the client's retry
+                      _rl_annotate(thread_reuse=f"hit>fallback:{exc.status_code or 'err'}")
+                      if exc.status_code in (429, 503) and not got_items:
+                          _tr.STORE.restore(meta.get("_reuse_entry"))
+                  meta.pop("_same_thread_502_keep", None)
+                  # never re-hit a fair-use rate limit on the same account: fail over to another
+                  # free account (fresh full thread) like standard mode, else surface it
+                  # Any retriable failure (fair-use 429/503, empty stream 502, dead token 401):
+                  # rest this account and fail over to another free one. Retrying the same
+                  # account only works for one-off glitches, so do that only when alone.
+                  can_failover = (exc.retriable and pool is not None and attempt < TOOL_MODE_MAX_ATTEMPTS
+                                  and _other_account_free(pool, client))
+                  if exc.status_code in (429, 503) and not can_failover:
                       raise
-                  pool.mark_failed(client, cooldown_seconds=int(os.getenv("NOTION_RATELIMIT_FAILOVER_COOLDOWN", "45") or 45))
-                  new_client = pool.get_client()
-                  logger.info("Rate-limited: failing over to another account", extra={"request_info": {
-                      "event": "ratelimit_failover", "mode": "tool", "from": getattr(client, "account_key", ""),
-                      "to": getattr(new_client, "account_key", ""), "status": exc.status_code}})
-                  client = new_client
-                  account = getattr(client, "account_label", "") or getattr(client, "account_key", "")
-                  thread_id = None
-              elif not (exc.retriable and attempt < TOOL_MODE_MAX_ATTEMPTS):
-                  raise
-              logger.info("Tool mode: upstream error, retrying",
-                          extra={"request_info": {"event": "tool_mode_retry_upstream", "attempt": attempt}})
-              failed = True
+                  if can_failover:
+                      rl = exc.status_code in (429, 503)
+                      pool.mark_failed(client, cooldown_seconds=int(os.getenv("NOTION_RATELIMIT_FAILOVER_COOLDOWN", "45") or 45) if rl else 3)
+                      new_client = pool.get_client(True, tried)
+                      logger.info("Rate-limited: failing over to another account", extra={"request_info": {
+                          "event": "ratelimit_failover", "mode": "tool", "from": getattr(client, "account_key", ""),
+                          "to": getattr(new_client, "account_key", ""), "status": exc.status_code}})
+                      client = new_client
+                      tried.add(getattr(client, "account_key", ""))
+                      account = getattr(client, "account_label", "") or getattr(client, "account_key", "")
+                      thread_id = None
+                  elif not (exc.retriable and attempt < TOOL_MODE_MAX_ATTEMPTS):
+                      raise
+                  logger.info("Tool mode: upstream error, retrying",
+                              extra={"request_info": {"event": "tool_mode_retry_upstream", "attempt": attempt}})
+                  failed = True
         finally:
             # client gone (GeneratorExit) or error: _tick_iter's worker closes the Notion
             # stream at its next item, which ends generation and frees the account
@@ -1168,7 +1324,26 @@ def _run_tool_attempts(client, transcript, *, include_usage, account, tools, par
         if calls:
             break
         if not text.strip() and attempt < TOOL_MODE_MAX_ATTEMPTS:
-            # e.g. Notion's built-in URL fetch / confirmation failed mid-answer: nothing usable
+            # an empty answer usually means the account's inference stalled: retry on
+            # another free account (fresh thread) instead of the same one
+            if pool is not None and _other_account_free(pool, client):
+                try:
+                    pool.mark_failed(client)  # counts toward the account's failure streak
+                    new_client = pool.get_client(True, tried)
+                    if new_client is not client:
+                        logger.info("Empty answer: failing over to another account", extra={"request_info": {
+                            "event": "empty_failover", "from": getattr(client, "account_key", ""),
+                            "to": getattr(new_client, "account_key", "")}})
+                        client = new_client
+                        tried.add(getattr(client, "account_key", ""))
+                        account = getattr(client, "account_label", "") or getattr(client, "account_key", "")
+                        thread_id = None
+                except Exception:
+                    pass
+            # e.g. Notion's built-in URL fetch / confirmation failed mid-answer: nothing usable.
+            # High effort thinks silently the longest (Notion drops the stream after ~60s idle):
+            # retry at medium effort (TOOL_MODE_EMPTY_LOWER_EFFORT=0 disables)
+            lower_effort = os.getenv("TOOL_MODE_EMPTY_LOWER_EFFORT", "1").strip().lower() not in ("0", "false", "off", "no")
             logger.info("Tool mode: empty answer, retrying",
                         extra={"request_info": {"event": "tool_mode_retry_empty", "attempt": attempt}})
             continue
@@ -1183,11 +1358,24 @@ def _run_tool_attempts(client, transcript, *, include_usage, account, tools, par
     yield ("done", result)
 
 
-def _tool_mode_non_stream(gen, response_id, model):
+class _ClientGone(Exception):
+    pass
+
+
+def _tool_mode_non_stream(gen, response_id, model, cancel=None):
     result = None
     for ev in gen:
         if isinstance(ev, tuple):
             result = ev[1]
+        elif cancel is not None and cancel.is_set():
+            # client disconnected: stop retries / thread polling and close the Notion stream
+            try:
+                gen.close()
+            except Exception:
+                pass
+            raise _ClientGone()
+    if result is None:
+        raise _ClientGone()
     calls = result["calls"]
     if not calls and not result["text"].strip():
         raise NotionUpstreamError("Notion upstream returned empty content.", retriable=True)
@@ -1201,6 +1389,150 @@ def _tool_mode_non_stream(gen, response_id, model):
         "choices": [{"index": 0, "message": msg, "finish_reason": "tool_calls" if calls else "stop", "logprobs": None}],
         "usage": _openai_usage(result["collector"]),
     })
+
+
+async def _client_disconnected(request) -> bool:
+    raw = request.scope.get("n2a_raw_receive")
+    if raw is None:
+        return await request.is_disconnected()
+    import anyio
+    msg = None
+    with anyio.move_on_after(0.01):
+        msg = await raw()  # body is already consumed: only http.disconnect can arrive
+    return bool(msg) and msg.get("type") == "http.disconnect"
+
+
+def _collect_items_cancellable(first_item, stream_gen, cancel=None):
+    out = []
+    for x in _iter_stream_items(first_item, stream_gen):
+        if cancel is not None and cancel.is_set():
+            try:
+                stream_gen.close()
+            except Exception:
+                pass
+            raise _ClientGone()
+        out.append(x)
+    return out
+
+
+async def _run_tool_non_stream_cancellable(request, gen, response_id, model):
+    return await _run_cancellable(request, _tool_mode_non_stream, gen, response_id, model)
+
+
+async def _run_cancellable(request, fn, *args):
+    """Run fn(*args, cancel) in a worker thread; if the client disconnects meanwhile, set
+    `cancel` so the upstream work (up to NOTION_REQUEST_BUDGET) stops burning quota.
+    Returns a 499 Response when it was cancelled."""
+    import threading as _th
+    cancel = _th.Event()
+    task = asyncio.ensure_future(_rtp(fn, *args, cancel))
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=2.0)
+            if done:
+                break
+            try:
+                if await _client_disconnected(request):
+                    cancel.set()
+                    logger.info("Non-stream: client disconnected, stopping upstream",
+                                extra={"request_info": {"event": "nonstream_client_disconnected"}})
+                    _request_log_annotate(error_code="CLIENT_DISCONNECTED")
+            except Exception:
+                pass
+        return task.result()
+    except _ClientGone:
+        return Response(status_code=499)
+    except asyncio.CancelledError:
+        cancel.set()
+        raise
+
+
+_GEN_END = object()
+
+
+def _next_or_end(gen):
+    try:
+        return next(gen)
+    except StopIteration:
+        return _GEN_END
+
+
+def _close_when_idle(gen, limit: float = 120.0) -> None:
+    """Close a sync generator that may still be executing in a worker thread."""
+    end = time.time() + limit
+    while time.time() < end:
+        try:
+            gen.close()
+            return
+        except ValueError:  # "generator already executing": wait for the in-flight next()
+            time.sleep(0.1)
+        except Exception:
+            return
+
+
+async def _guarded_stream(request, gen, meta=None):
+    """Serve a blocking SSE generator from a worker thread while watching the client.
+    Starlette neither closes a sync body iterator on disconnect nor (behind
+    BaseHTTPMiddleware) reports http.disconnect to it, so a dropped client kept Notion
+    generating until the answer ended (tens of seconds, holding the account). Here the
+    raw ASGI receive is polled; on disconnect the in-flight Notion read is aborted
+    (meta) and the generator closed, which ends retries / thread polling."""
+    import anyio
+    import threading as _th
+    stop = _th.Event()
+
+    async def watch():
+        while not stop.is_set():
+            await asyncio.sleep(1.0)
+            try:
+                if await _client_disconnected(request):
+                    stop.set()
+                    logger.info("Stream: client disconnected, stopping upstream",
+                                extra={"request_info": {"event": "stream_client_gone"}})
+                    _request_log_annotate(error_code="CLIENT_DISCONNECTED")
+                    await anyio.to_thread.run_sync(_abort_upstream, meta)
+                    return
+            except Exception:
+                return
+
+    watcher = asyncio.ensure_future(watch())
+    finished = False
+    try:
+        while not stop.is_set():
+            chunk = await anyio.to_thread.run_sync(_next_or_end, gen, abandon_on_cancel=True)
+            if chunk is _GEN_END:
+                finished = True
+                return
+            if stop.is_set():
+                return
+            yield chunk
+    finally:
+        stop.set()
+        watcher.cancel()
+        if isinstance(meta, dict) and not finished:
+            meta["_cancelled"] = True
+        _th.Thread(target=_close_when_idle, args=(gen,), name="close-stream", daemon=True).start()
+
+
+def _prepull_tool_events(gen):
+    """Pull tool-mode events until the first keepalive tick or the final result.
+    Returns (events, exception)."""
+    held = []
+    try:
+        for ev in gen:
+            held.append(ev)
+            if ev == "tick" or isinstance(ev, tuple):
+                break
+    except Exception as exc:  # noqa: BLE001 - re-raised by the caller
+        return held, exc
+    return held, None
+
+
+def _chain_events(held, gen):
+    yield from held
+    if held and isinstance(held[-1], tuple):
+        return
+    yield from gen
 
 
 def _tool_mode_stream(gen, response_id, model, client_type=""):
@@ -1237,6 +1569,8 @@ def _tool_mode_stream(gen, response_id, model, client_type=""):
         yield "data: [DONE]\n\n"
         return
     started = True  # role chunk already sent
+    if result is None:  # cancelled (client gone)
+        return
     if not result["calls"] and not (result["text"] or "").strip():
         err = {"message": "Notion upstream returned empty content, please retry.", "type": "upstream_error",
                "code": "EMPTY_CONTENT", "status": 502}
@@ -1431,14 +1765,14 @@ async def _handle_lite_request(
     for attempt in range(1, max_retries + 1):
         client = None
         try:
-            client = pool.get_client()
+            client = await _rtp(pool.get_client)
 
             # 构建 Lite transcript（无历史记忆）
             transcript = _apply_reasoning_effort(build_lite_transcript(user_prompt, req_body.model), req_body)
 
             # 调用 Notion API（不使用 thread_id）
             stream_gen = _UsageCollector(client.stream_response(transcript, thread_id=None), include_usage=_include_usage_flag(req_body), account=getattr(client, "account_label", "") or getattr(client, "account_key", ""))
-            first_item = next(stream_gen, None)
+            first_item = await _rtp(next, stream_gen, None)
 
             if first_item is None:
                 raise NotionUpstreamError(
@@ -1468,7 +1802,8 @@ async def _handle_lite_request(
             authoritative_final_content = ""
             authoritative_final_source_type = ""
 
-            for raw_item in _iter_stream_items(first_item, stream_gen):
+            _items = await _rtp(lambda: list(_iter_stream_items(first_item, stream_gen)))
+            for raw_item in _items:
                 item = _normalize_stream_item(raw_item)
                 item_type = item.get("type")
 
@@ -1679,7 +2014,8 @@ async def _handle_standard_request(
             tool_reminder = f"(Reply with a <tool_call> action block for `{forced_tool}`.)"
         elif tool_mode == "required":
             tool_reminder = "(Reply with at least one <tool_call> action block.)"
-    last_role = req_body.messages[-1].role if req_body.messages else ""
+    _non_sys = [m for m in (req_body.messages or []) if m.role not in ("system", "developer")]
+    last_role = _non_sys[-1].role if _non_sys else ""
     if last_role in ("tool", "function"):
         from app.tool_emulation import TOOL_RESULT_REMINDER
         tool_reminder = TOOL_RESULT_REMINDER
@@ -1696,22 +2032,90 @@ async def _handle_standard_request(
     if reuse_on:
         tr_norm = _tr.normalize_history(messages_all)
 
-        def _tr_accept(k, _n=tr_norm):
+        def _tr_accept(k, e=None, _n=tr_norm):
             new_msgs = _n[k:]
+            # side request (title / summary / compaction fork without tools): reuse the main
+            # conversation thread (was veto side:no_tools -> cold start). Entry is restored
+            # after take so the main agent loop can still continue.
+            if e is not None and e.get("tp") and not tool_prompt:
+                return None  # accept as side reuse
             if not new_msgs:
                 return "shape:empty"
-            if new_msgs[-1].get("role") not in ("user", "tool", "function"):
-                return "shape:last_" + str(new_msgs[-1].get("role"))
+            # agent clients (e.g. Claude Code) append a system/developer note after the
+            # latest user/tool turn; judge the shape by the last non-system message
+            convo = [m for m in new_msgs if m.get("role") not in ("system", "developer")]
+            if not convo:
+                return "shape:only_system"
+            if convo[-1].get("role") not in ("user", "tool", "function"):
+                return "shape:last_" + str(convo[-1].get("role"))
             return None
 
-        entry, k, reuse_status = _tr.STORE.take(tr_ns, tr_norm, accept=_tr_accept)
+        # sqlite-backed (admin.db, busy timeout): keep it off the event loop
+        entry, k, reuse_status = await _rtp(_tr.STORE.take, tr_ns, tr_norm, accept=_tr_accept)
         if entry is not None:
-            reuse_plan = {"entry": entry, "new": tr_norm[k:], "k": k, "norm": tr_norm}
+            new_msgs = list(tr_norm[k:])
+            # system lines (prefix part) the continued thread hasn't seen: a dynamic date /
+            # memory / project context is sent as a small update; trailing system notes in
+            # new_msgs are sent anyway
+            delta = _tr.sys_delta(tr_norm[:k], entry.get("sh") or [])
+            tools_changed = bool(tool_prompt) and _tr.tp_hash(tool_prompt) != (entry.get("tp") or "")
+            side_no_tools = bool(entry.get("tp")) and not tool_prompt
+            if delta:
+                new_msgs.insert(0, {"role": "system", "content": "Updated context (changed since earlier in this conversation):\n" + delta})
+            if side_no_tools:
+                # Reuse main thread for this side request, but put the entry back so the
+                # main agent turn can still take it (do not clobber tp with empty tools).
+                await _rtp(_tr.STORE.restore, entry)
+                reuse_status = "hit:side"
+            if entry.get("pt") is not None:
+                try:
+                    _rl_annotate(prev_prompt_tokens=int(entry["pt"]))
+                except (TypeError, ValueError):
+                    pass
+            reuse_plan = {"entry": entry, "new": new_msgs, "k": k, "norm": tr_norm,
+                          "sys_delta_lines": delta.count("\n") + 1 if delta else 0, "tools_changed": tools_changed,
+                          "side_no_tools": side_no_tools}
         elif reuse_status not in ("short",):
             try:
-                tr_diag = _tr.STORE.diagnose(tr_ns, tr_norm)
+                tr_diag = await _rtp(_tr.STORE.diagnose, tr_ns, tr_norm)
             except Exception:
                 tr_diag = None
+
+    # effort telemetry + conversation cap memory (app.cap_memory)
+    from app import cap_memory as _cm
+    from app.request_log import current_log as _rl_cur
+    conv_keys: list = []
+    try:
+        from app.model_registry import clamp_effort as _ce, normalize_effort as _ne, get_notion_model as _gnm
+        from app.long_gen import looks_long_generation as _llg
+        _nm = _gnm(req_body.model)
+        eff_req = _ce(_nm, _ne(req_body.reasoning_effort)) or ""
+        _ask = _last_user_ask(messages_all)
+        _long = bool(_llg(_ask))
+        _cmt = req_body.max_completion_tokens or req_body.max_tokens
+        _wt = _cm.has_write_tool(tools)
+        _ident = tr_ident or (_tr.identity(request.headers, req_body.user)[0])
+        _ck = _cm.conv_key(_ident, messages_all)
+        conv_keys = [k for k in (_ck, ("t:" + reuse_plan["entry"]["thread_id"]) if reuse_plan else "") if k]
+        eff_mapped = _cm.map_max(eff_req)
+        eff_final, mem_status = _cm.decide(conv_keys, eff_mapped)
+        _wd = _cm.would_downgrade(eff_req, _long, _cmt, _wt)
+        route = _cm.autoroute_mode()
+        if mem_status is None and _wd and route == "on":
+            eff_final, mem_status = "high", "autoroute"
+        if mem_status is None and eff_mapped != eff_req:
+            mem_status = "max_mapped"
+        if eff_final != eff_req:
+            req_body.reasoning_effort = eff_final
+            logger.info("Effort lowered for this conversation", extra={"request_info": {
+                "event": "cap_memory_applied", "from": eff_req, "to": eff_final, "why": mem_status,
+                "conv_key": _ck, "state": _cm.state(conv_keys)}})
+        _rl_annotate(effort_req=eff_req or None, effort_final=eff_final or None, client_max_tokens=_cmt,
+                     has_tools=bool(tools), n_tools=len(tools or []), ask_chars=len(_ask or ""),
+                     long_gen_match=_long, conv_key=_ck or None, cap_memory=mem_status,
+                     would_downgrade=(_wd if route != "off" else None), _conv_keys=conv_keys)
+    except Exception as _exc:
+        logger.warning(f"effort telemetry failed: {_exc}")
 
     def _finish_transcript(t):
         t = _apply_reasoning_effort(t, req_body)
@@ -1724,19 +2128,43 @@ async def _handle_standard_request(
             t = [_defang_urls(b) if isinstance(b, dict) and b.get("type") not in ("config", "context") else b for b in t]
         return t
 
+    # whole-request budget (non-tool path; tool mode has its own in _run_tool_attempts):
+    # bounds thread-recover polling and the retry loop so a request can't run ~15 min
+    _budget = float(os.getenv("NOTION_REQUEST_BUDGET", "330") or 0)
+    req_deadline = time.time() + _budget if _budget > 0 else None
+    last_exc: NotionUpstreamError | None = None
+    tried_accounts: set = set()
     for attempt in range(1, max_retries + 1):
+        if attempt > 1 and req_deadline and time.time() > req_deadline - 60:
+            logger.info("Standard mode: request budget exhausted, not retrying", extra={"request_info": {
+                "event": "standard_budget_exhausted", "attempt": attempt, "budget_s": _budget}})
+            if last_exc is not None:
+                return _upstream_error_response(last_exc)
+            break
         client = None
-        tr_meta: dict = {}
+        tr_meta: dict = {"_deadline": req_deadline, "_conv_keys": conv_keys, "_rl": _rl_cur.get()}
         reuse_tid = None
+        tr_started = True  # until the continued request is dispatched
         try:
             if reuse_plan is not None:
                 client = pool.get_client_by_key(reuse_plan["entry"]["account"])
+                if client is None and hasattr(pool, "key_cooldown_left"):
+                    # the thread's account is only briefly cooling: wait for it rather than
+                    # lose the conversation cache on a fresh thread elsewhere
+                    left = pool.key_cooldown_left(reuse_plan["entry"]["account"])
+                    if 0 < left <= float(os.getenv("THREAD_REUSE_WAIT_COOLDOWN", "8") or 0):
+                        await asyncio.sleep(left + 0.05)
+                        client = pool.get_client_by_key(reuse_plan["entry"]["account"])
+                        if client is not None:
+                            reuse_plan["waited"] = round(left, 1)
                 if client is None:
                     reuse_status, reuse_plan = "account_unavailable", None
                 else:
                     reuse_tid = reuse_plan["entry"]["thread_id"]
             if client is None:
-                client = pool.get_client()
+                # may sleep for a cooling account: never on the event loop
+                client = await _rtp(pool.get_client, True, tried_accounts)
+            tried_accounts.add(getattr(client, "account_key", ""))
 
             # 构建 Standard transcript（完整上下文）
             # 从 client 提取账号信息
@@ -1753,11 +2181,14 @@ async def _handle_standard_request(
                 tool_prompt=tool_prompt, tool_reminder=tool_reminder,
             ))
             full_transcript = transcript
+            tr_meta["_hedge_transcript"] = full_transcript  # fresh-thread transcript for an effort hedge
+            tr_meta["_user_ask"] = _last_user_ask(messages)  # long-generation heuristic (app.long_gen)
             if reuse_tid:
                 # continue the stored Notion thread: only the new messages, no instructions /
                 # tool preamble (already in the thread), reminder only after tool results
                 transcript = _finish_transcript(build_standard_transcript(
-                    reuse_plan["new"], req_body.model, account, tool_prompt="",
+                    reuse_plan["new"], req_body.model, account,
+                    tool_prompt=tool_prompt if reuse_plan.get("tools_changed") else "",
                     tool_reminder=tool_reminder if last_role in ("tool", "function") else "",
                     name_context=reuse_plan["norm"][:reuse_plan["k"]],
                     inject_default_system=False,
@@ -1766,35 +2197,71 @@ async def _handle_standard_request(
                 "event": "thread_reuse_hit" if reuse_tid else "thread_reuse_miss",
                 "reason": reuse_status, "thread_id": reuse_tid, "prefix_msgs": (reuse_plan or {}).get("k"),
                 "new_msgs": len((reuse_plan or {}).get("new") or []), "account": client.account_key,
-                "identity_sources": tr_ident_src, **({"diag": tr_diag} if tr_diag and not reuse_tid else {})}})
+                "sys_delta_lines": (reuse_plan or {}).get("sys_delta_lines"), "tools_changed": (reuse_plan or {}).get("tools_changed"),
+                "waited_s": (reuse_plan or {}).get("waited"), "identity_sources": tr_ident_src, **({"diag": tr_diag} if tr_diag and not reuse_tid else {})}})
             if reuse_on:
                 _rl_annotate(thread_reuse=(reuse_status if reuse_tid else f"miss:{reuse_status}"))
+            if reuse_tid:
+                try:
+                    _cm.alias(conv_keys, "t:" + reuse_tid)
+                    if "t:" + reuse_tid not in conv_keys:
+                        conv_keys.append("t:" + reuse_tid)
+                        tr_meta["_conv_keys"] = conv_keys
+                except Exception:
+                    pass
 
             def _tr_store(reply, _meta=tr_meta, _msgs=messages):
                 if not reuse_on or not reply:
                     return
-                _tr.STORE.put(tr_ns, _msgs, reply, _meta.get("thread_id"), _meta.get("account"))
+                if (reuse_plan or {}).get("side_no_tools"):
+                    return  # side fork: entry already restored; do not overwrite main tp
+                pt = None
+                try:
+                    rec = _meta.get("_rl") if isinstance(_meta, dict) else None
+                    col = (rec or {}).get("_collector")
+                    raw = getattr(col, "raw", None) if col is not None else None
+                    if raw:
+                        pt = int(raw.get("inputTokens", 0) or 0) + int(raw.get("cachedTokensCreated", 0) or 0)
+                except Exception:
+                    pt = None
+                _tr.STORE.put(tr_ns, _msgs, reply, _meta.get("thread_id"), _meta.get("account"),
+                              tool_prompt=tool_prompt, prompt_tokens=pt)
 
             if tools_active:
+                if reuse_tid:
+                    tr_meta["_reuse_entry"] = reuse_plan["entry"]
                 tool_gen = _run_tool_attempts(
                     client, transcript, include_usage=_include_usage_flag(req_body),
                     account=getattr(client, "account_label", "") or getattr(client, "account_key", ""),
                     tools=tools, parallel=parallel_tools, mode=tool_mode,
-                    thread_id=reuse_tid, fallback_transcript=full_transcript, meta=tr_meta, pool=pool,
+                    thread_id=reuse_tid, fallback_transcript=full_transcript,
+                    meta=tr_meta, pool=pool,
                 )
                 if req_body.stream:
+                    # Hold the first byte until the first keepalive tick (~5s) or the result: an
+                    # upstream failure inside that window (fair-use 503, dead account, every
+                    # failover exhausted) then gets a real HTTP error status. Once streaming has
+                    # started it can only be an in-stream error event, which new-api's
+                    # OpenAI->Anthropic conversion drops (client sees an empty end_turn).
+                    held, early_exc = await _rtp(_prepull_tool_events, tool_gen)
+                    if early_exc is not None:
+                        raise early_exc  # handled below like the non-stream path (failover / JSON error)
                     return StreamingResponse(
-                        _tr_capture_stream(_tool_mode_stream(tool_gen, response_id, req_body.model,
-                                          request.headers.get("X-Client-Type", "").lower()), _tr_store),
+                        _guarded_stream(request, _tr_capture_stream(_tool_mode_stream(_chain_events(held, tool_gen), response_id, req_body.model,
+                                          request.headers.get("X-Client-Type", "").lower()), _tr_store), tr_meta),
                         media_type="text/event-stream",
                         headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
                     )
-                resp = _tool_mode_non_stream(tool_gen, response_id, req_body.model)
-                _tr_store(_tr_reply_from_response(resp))
+                # blocking (Notion stream + thread polling + retries): never on the event loop,
+                # or one slow request freezes every other request and /health
+                resp = await _run_tool_non_stream_cancellable(request, tool_gen, response_id, req_body.model)
+                await _rtp(_tr_store, _tr_reply_from_response(resp))
                 return resp
 
+            tr_started = False
             stream_gen = _UsageCollector(client.stream_response(transcript, thread_id=reuse_tid, meta=tr_meta), include_usage=_include_usage_flag(req_body), account=getattr(client, "account_label", "") or getattr(client, "account_key", ""))
-            first_item = next(stream_gen, None)
+            first_item = await _rtp(next, stream_gen, None)
+            tr_started = first_item is not None
 
             if first_item is None:
                 raise NotionUpstreamError(
@@ -1811,21 +2278,21 @@ async def _handle_standard_request(
                 client_type = request.headers.get("X-Client-Type", "").lower()
                 if tools_active:
                     return StreamingResponse(
-                        _create_tool_stream_generator(
+                        _guarded_stream(request, _create_tool_stream_generator(
                             response_id, req_body.model, first_item, stream_gen,
                             tools, parallel_tools, client_type=client_type,
-                        ),
+                        ), tr_meta),
                         media_type="text/event-stream",
                         headers=stream_headers,
                     )
                 return StreamingResponse(
-                    _tr_capture_stream(_create_standard_stream_generator(
+                    _guarded_stream(request, _tr_capture_stream(_create_standard_stream_generator(
                         response_id,
                         req_body.model,
                         first_item,
                         stream_gen,
                         client_type=client_type,
-                    ), _tr_store),
+                    ), _tr_store), tr_meta),
                     media_type="text/event-stream",
                     headers=stream_headers,
                 )
@@ -1837,7 +2304,12 @@ async def _handle_standard_request(
             authoritative_final_content = ""
             authoritative_final_source_type = ""
 
-            for raw_item in _iter_stream_items(first_item, stream_gen):
+            # the rest of the Notion stream is blocking network reads: collect it in a worker
+            # thread (iterating here froze the event loop and /health for the whole answer)
+            _items = await _run_cancellable(request, _collect_items_cancellable, first_item, stream_gen)
+            if isinstance(_items, Response):
+                return _items  # client disconnected
+            for raw_item in _items:
                 item = _normalize_stream_item(raw_item)
                 item_type = item.get("type")
 
@@ -1908,7 +2380,7 @@ async def _handle_standard_request(
                         "choices": [{"index": 0, "message": msg, "finish_reason": "tool_calls", "logprobs": None}],
                         "usage": _openai_usage(stream_gen),
                     })
-                    _tr_store(_tr_reply_from_response(resp))
+                    await _rtp(_tr_store, _tr_reply_from_response(resp))
                     return resp
 
                 response_text = full_text
@@ -1920,6 +2392,7 @@ async def _handle_standard_request(
             # 如果有 thinking，添加到扩展字段（前端会读取）
             if thinking_parts:
                 response_message.thinking = "".join(thinking_parts)
+                response_message.reasoning_content = response_message.thinking  # OpenAI-compat field (new-api -> Anthropic thinking)
 
             # 构建响应
             response_obj = ChatCompletionResponse(
@@ -1946,11 +2419,26 @@ async def _handle_standard_request(
                         "sources": all_sources,
                     }
 
-            _tr_store(_tr_reply_from_response(response_obj))
+            await _rtp(_tr_store, _tr_reply_from_response(response_obj))
             return response_obj
 
         except NotionUpstreamError as exc:
+            last_exc = exc
+            # 502 on a continued thread: short-retry same Notion thread once before fallback.
+            if (reuse_plan is not None and exc.retriable and (exc.status_code or 0) == 502
+                    and not tr_started and not tr_meta.get("_same_thread_502_retried")
+                    and not tr_meta.get("_cancelled") and attempt < max_retries):
+                tr_meta["_same_thread_502_retried"] = True
+                from app.request_log import annotate as _rl_annotate
+                _rl_annotate(thread_reuse="hit>retry502")
+                logger.info("Standard mode: 502 on continued thread, short-retry same thread",
+                            extra={"request_info": {"event": "standard_same_thread_502_retry",
+                                                    "attempt": attempt,
+                                                    "thread_id": (reuse_plan.get("entry") or {}).get("thread_id")}})
+                continue  # reuse_plan kept; same account/thread
             if reuse_plan is not None:
+                if exc.status_code in (429, 503) and not tr_started:
+                    await _rtp(_tr.STORE.restore, reuse_plan["entry"])  # rejected: thread unchanged
                 reuse_status, reuse_plan = "upstream_error", None
             if client is not None and exc.retriable:
                 pool.mark_failed(client)
@@ -2189,7 +2677,7 @@ async def _create_chat_completion_impl(
     for attempt in range(1, max_retries + 1):
         client = None
         try:
-            client = pool.get_client()
+            client = await _rtp(pool.get_client)
             transcript_payload = manager.get_transcript_payload(
                 notion_client=client,
                 conversation_id=conversation_id,

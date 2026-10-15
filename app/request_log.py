@@ -19,20 +19,59 @@ def annotate(**kw: Any) -> None:
         rec.update({k: v for k, v in kw.items() if v is not None})
 
 
+def annotate_meta(meta, **kw: Any) -> None:
+    """Annotate the request record carried in meta["_rl"] (set by the request path), so
+    worker threads / generators without the context var still reach it; falls back to
+    the context var."""
+    rec = meta.get("_rl") if isinstance(meta, dict) else None
+    if rec is None:
+        rec = current_log.get()
+    if rec is not None:
+        rec.update({k: v for k, v in kw.items() if v is not None})
+
+
 def _finalize(rec: dict) -> dict:
     col = rec.pop("_collector", None)
+    keys = rec.pop("_conv_keys", None)
     raw = getattr(col, "raw", None) if col is not None else None
     if raw:
-        rec["prompt_tokens"] = int(raw.get("inputTokens", 0)) + int(raw.get("cachedTokensCreated", 0))
-        rec["completion_tokens"] = int(raw.get("outputTokens", 0))
-        rec["cached_tokens"] = int(raw["cachedTokensRead"]) if "cachedTokensRead" in raw else None
+        inp = int(raw.get("inputTokens", 0) or 0)
+        created = int(raw.get("cachedTokensCreated", 0) or 0)
+        cread = int(raw.get("cachedTokensRead", 0) or 0) if ("cachedTokensRead" in raw) else None
+        rec["prompt_tokens"] = inp + created
+        rec["completion_tokens"] = int(raw.get("outputTokens", 0) or 0)
+        rec["cached_tokens"] = cread
+        # Always write cost-estimate fields when usage is present (0 if Notion omitted the key).
+        # Notion inputTokens = uncached + cache read; cachedTokensCreated counted separately.
+        rec["cache_write_tokens"] = created
+        rec["uncached_input_tokens"] = max(0, inp - (cread or 0))
         rec["usage_reported"] = 1
+        prev = rec.get("prev_prompt_tokens")
+        if prev is not None:
+            try:
+                prev_i = int(prev)
+                rec["prompt_shrink"] = 1 if rec["prompt_tokens"] < prev_i else 0
+            except (TypeError, ValueError):
+                pass
     else:
         rec["usage_reported"] = 0
     if col is not None and getattr(col, "error", None) and not rec.get("error_code"):
         rec["error_code"] = "stream_error"
         rec["error_message"] = str(col.error)[:300]
     rec["stream"] = 1 if rec.get("stream") else 0
+    if rec.get("notion_output_tokens") is None and rec.get("completion_tokens") is not None:
+        rec["notion_output_tokens"] = rec["completion_tokens"]
+    for b in ("has_tools", "long_gen_match", "silent_close", "would_downgrade"):
+        if b in rec:
+            rec[b] = 1 if rec[b] else 0
+    if rec.get("cap_memory") == "probe" and keys and not rec.get("silent_close") \
+            and (rec.get("status") or 0) < 400 and not rec.get("error_code"):
+        try:
+            from app import cap_memory
+            cap_memory.probe_ok(keys)
+            rec["cap_memory"] = "probe_ok"
+        except Exception:
+            pass
     return rec
 
 
@@ -43,6 +82,10 @@ class RequestLogMiddleware:
         self.get_ip = get_ip
 
     async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            # the raw ASGI receive, for disconnect polling in long non-stream handlers:
+            # BaseHTTPMiddleware's wrapped receive never reports http.disconnect
+            scope["n2a_raw_receive"] = receive
         if scope["type"] != "http" or scope.get("path") not in LOGGED_PATHS:
             await self.app(scope, receive, send)
             return

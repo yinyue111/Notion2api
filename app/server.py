@@ -19,6 +19,43 @@ from app.api.models import router as models_router
 from app.logger import logger
 from app.limiter import limiter
 
+def _start_loop_watchdog() -> None:
+    """Docker only marks the container unhealthy, it never restarts it. If the event loop
+    stops answering for LOOP_WATCHDOG_SECS (a blocking call slipped onto it), exit so the
+    restart policy brings the service back instead of hanging every request."""
+    import asyncio as _aio
+    import threading as _th
+    limit = float(os.getenv("LOOP_WATCHDOG_SECS", "120") or 0)
+    if limit <= 0:
+        return
+    loop = _aio.get_running_loop()
+    state = {"last": time.monotonic()}
+
+    def _beat():
+        state["last"] = time.monotonic()
+
+    def _watch():
+        warned = False
+        while True:
+            time.sleep(5)
+            try:
+                loop.call_soon_threadsafe(_beat)
+            except RuntimeError:
+                return  # loop closed (shutdown)
+            lag = time.monotonic() - state["last"]
+            if lag > 15 and not warned:
+                warned = True
+                logger.warning("Event loop stalled", extra={"request_info": {"event": "loop_stall", "lag_s": round(lag, 1)}})
+            elif lag <= 15:
+                warned = False
+            if lag > limit:
+                logger.error("Event loop unresponsive, exiting for restart", extra={"request_info": {
+                    "event": "loop_watchdog_exit", "lag_s": round(lag, 1)}})
+                os._exit(3)
+
+    _th.Thread(target=_watch, name="loop-watchdog", daemon=True).start()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 启动时初始化状态
@@ -53,6 +90,22 @@ async def lifespan(app: FastAPI):
 
     app.state.start_time = time.time()
     app.state.mode = mode
+    _start_loop_watchdog()
+    from app import thread_janitor as _tj
+    _tj.start(lambda: getattr(app.state, "account_pool", None))
+    from app import usage_monitor as _um
+    _st = app.state.admin_store
+
+    def _persist_usage(client, st, _st=_st):
+        aid = getattr(client, "admin_id", None)
+        if _st is None or aid is None:
+            return
+        cur = next((a.get("credits") for a in _st.list_accounts() if a.get("id") == aid), None) or {}
+        cur = dict(cur) if isinstance(cur, dict) else {}
+        cur["rateLimit"] = st
+        _st.set_credits(aid, cur)
+    app.state.account_pool.on_usage_status = _persist_usage
+    _um.start(lambda: getattr(app.state, "account_pool", None))
     yield
     # 关闭时清理
     logger.info("Service shutting down", extra={"request_info": {"event": "shutdown"}})
@@ -242,7 +295,9 @@ async def favicon():
     return Response(content=b"", media_type="image/x-icon", status_code=204)
 
 @app.get("/health", tags=["system"])
-def health_check():
+async def health_check():
+    # async on purpose: a sync handler needs a free threadpool worker, so /health would
+    # hang (and the container go unhealthy) exactly when Notion calls saturate the pool
     return {"status": "ok"}
 
 # 挂载静态前端到根目录

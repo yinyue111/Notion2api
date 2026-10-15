@@ -33,6 +33,8 @@ class AccountPool:
         self._current_index = 0
         self._lock = threading.Lock()
         self._last_primary = None
+        for c in self.clients:
+            c._pool = self
 
     @staticmethod
     def _fp(acc: dict) -> tuple:
@@ -54,6 +56,8 @@ class AccountPool:
                     c, cd = NotionOpusAPI(acc), 0.0
                 clients.append(c); cds.append(cd); fps.append(fp)
             self.clients, self.cooldown_until, self._fingerprints = clients, cds, fps
+            for c in clients:
+                c._pool = self
             self._current_index = 0
         logger.info("Account pool reloaded", extra={"request_info": {"event": "account_pool_reloaded", "accounts": len(clients)}})
 
@@ -62,7 +66,7 @@ class AccountPool:
         with self._lock:
             return {getattr(c, "admin_id", None): max(0, int(cd - now)) for c, cd in zip(self.clients, self.cooldown_until)}
         
-    def get_client(self, wait_if_cooling: bool = True) -> NotionOpusAPI:
+    def get_client(self, wait_if_cooling: bool = True, avoid=None) -> NotionOpusAPI:
         """
         轮询（Round-Robin）返回下一个可用客户端。
         过滤掉正处于冷却期中的客户端。
@@ -71,7 +75,7 @@ class AccountPool:
         会等待最近的冷却结束后返回，而不是抛异常。
         """
         if strategy() == "priority":
-            return self._get_priority(wait_if_cooling)
+            return self._get_priority(wait_if_cooling, avoid)
         now = time.time()
         with self._lock:
             if not self.clients:
@@ -135,15 +139,41 @@ class AccountPool:
                 "cooling": cooling,
             }
                     
+    def other_free(self, client) -> bool:
+        """Another account (not `client`) is usable right now."""
+        now = time.time()
+        with self._lock:
+            return any(c is not client and cd <= now and not is_exhausted(c, now)
+                       for c, cd in zip(self.clients, self.cooldown_until))
+
+    @staticmethod
+    def mark_ok(client) -> None:
+        """A request on this account produced an answer: reset its failure streak."""
+        if getattr(client, "fail_streak", 0):
+            logger.info("Account recovered", extra={"request_info": {
+                "event": "account_recovered", "account": getattr(client, "account_key", ""),
+                "after_failures": client.fail_streak}})
+        client.fail_streak = 0
+
     def mark_failed(self, client: NotionOpusAPI, cooldown_seconds: int = 3):
         """
         标记某个客户端为临时不可用（默认冷却 3 秒后恢复）。
+        Consecutive failures (no successful answer in between) escalate the cooldown
+        (ACCOUNT_FAIL_BACKOFF_BASE * 2^(n-2), capped at ACCOUNT_FAIL_BACKOFF_MAX) so a
+        priority account stuck in Notion's fair-use throttle is not retried, at the cost
+        of a failed round trip, on every request.
         """
         with self._lock:
             try:
                 idx = self.clients.index(client)
-                # 记录未来的冷却解封时间
-                self.cooldown_until[idx] = time.time() + cooldown_seconds
+                streak = int(getattr(client, "fail_streak", 0) or 0) + 1
+                client.fail_streak = streak
+                if streak >= 2:
+                    base = float(os.getenv("ACCOUNT_FAIL_BACKOFF_BASE", "15") or 15)
+                    cap = float(os.getenv("ACCOUNT_FAIL_BACKOFF_MAX", "600") or 600)
+                    cooldown_seconds = int(max(cooldown_seconds, min(cap, base * 2 ** (streak - 2))))
+                # 记录未来的冷却解封时间（never shorten an existing longer cooldown）
+                self.cooldown_until[idx] = max(self.cooldown_until[idx], time.time() + cooldown_seconds)
                 logger.warning(
                     "Account marked as failed",
                     extra={
@@ -152,14 +182,26 @@ class AccountPool:
                             "account": client.account_key,
                             "space_id": client.space_id,
                             "cooldown_seconds": cooldown_seconds,
+                            "fail_streak": streak,
                         }
                     },
                 )
+                failed_ok = True
             except ValueError:
+                failed_ok = False
                 logger.warning(
                     "Attempted to mark unknown account as failed",
                     extra={"request_info": {"event": "account_failed_unknown"}},
                 )
+        if failed_ok:
+            # a failure may be Notion's rolling/monthly usage limit (empty stream, 503
+            # temporarily-unavailable, fair-use 429): one cheap status lookup (debounced)
+            # marks the account exhausted until its exact reset time. Never a model call.
+            try:
+                from app import usage_monitor
+                usage_monitor.trigger_check(self, client, "failure")
+            except Exception:
+                pass
 
     # ---------------- priority / failover ----------------
     def ordered_indices(self) -> List[int]:
@@ -177,7 +219,7 @@ class AccountPool:
             return (len(prio), i)
         return sorted(range(len(self.clients)), key=rank)
 
-    def _get_priority(self, wait_if_cooling: bool) -> NotionOpusAPI:
+    def _get_priority(self, wait_if_cooling: bool, avoid=None) -> NotionOpusAPI:
         while True:
             now = time.time()
             with self._lock:
@@ -188,6 +230,9 @@ class AccountPool:
                 if not cands:  # all exhausted: try the one whose recheck comes first
                     cands = sorted(order, key=lambda i: self.clients[i].exhausted_until)
                 free = [i for i in cands if self.cooldown_until[i] <= now]
+                if avoid:  # accounts this request already failed on go last
+                    fresh = [i for i in free if getattr(self.clients[i], "account_key", "") not in avoid]
+                    free = fresh or free
                 if free:
                     c = self.clients[free[0]]
                     key = getattr(c, "account_key", "")
@@ -210,6 +255,16 @@ class AccountPool:
                 if getattr(c, "account_key", "") == key:
                     return c if cd <= now and not is_exhausted(c, now) else None
         return None
+
+    def key_cooldown_left(self, key: str) -> float:
+        """Seconds until the account with this key leaves a (non-exhausted) cooldown;
+        0 if usable now, -1 if unknown or exhausted."""
+        now = time.time()
+        with self._lock:
+            for c, cd in zip(self.clients, self.cooldown_until):
+                if getattr(c, "account_key", "") == key:
+                    return -1.0 if is_exhausted(c, now) else max(0.0, cd - now)
+        return -1.0
 
     def mark_exhausted(self, client, seconds: float | None = None, reason: str = "") -> None:
         secs = exhaust_seconds() if seconds is None else seconds
@@ -238,6 +293,7 @@ class AccountPool:
                     "priority": rank + 1,
                     "exhausted_until": int(c.exhausted_until) if ex else None,
                     "exhausted_reason": getattr(c, "exhausted_reason", "") if ex else "",
+                    "usage": getattr(c, "usage_status", None),
                     "is_primary": strategy() == "priority" and getattr(c, "account_key", "") == self._last_primary,
                 }
             return out

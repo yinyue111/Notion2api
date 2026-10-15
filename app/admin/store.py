@@ -53,6 +53,9 @@ class AdminStore:
         cols = [r[1] for r in c.execute("PRAGMA table_info(request_log)")]
         if "thread_reuse" not in cols:
             c.execute("ALTER TABLE request_log ADD COLUMN thread_reuse TEXT")
+        for col, typ in self._EXTRA_COLS:
+            if col not in cols:
+                c.execute(f"ALTER TABLE request_log ADD COLUMN {col} {typ}")
         c.commit()
         try:
             os.chmod(path, 0o600)
@@ -172,6 +175,28 @@ class AdminStore:
         cfg["_label"] = r["label"] or ""
         return cfg
 
+    def find_account_id(self, space_id: str, user_id: str) -> Optional[int]:
+        r = self._conn().execute("SELECT id FROM accounts WHERE space_id=? AND user_id=?",
+                                 (str(space_id), str(user_id))).fetchone()
+        return r["id"] if r else None
+
+    def account_cost_since(self, account: str, since: Optional[float]) -> float:
+        """$ estimate of logged token usage for one account label since `since`."""
+        from app import quota_estimate as qe
+        if not account or since is None:
+            return 0.0
+        r = self._conn().execute(
+            "SELECT COALESCE(SUM(prompt_tokens),0) p, COALESCE(SUM(cached_tokens),0) c, "
+            "COALESCE(SUM(completion_tokens),0) o FROM request_log WHERE account=? AND ts>=?",
+            (account, float(since))).fetchone()
+        return qe.cost_usd(r["p"], r["c"], r["o"])
+
+    def account_first_log_ts(self, account: str) -> Optional[float]:
+        if not account:
+            return None
+        r = self._conn().execute("SELECT MIN(ts) t FROM request_log WHERE account=?", (account,)).fetchone()
+        return r["t"] if r else None
+
     def enabled_account_configs(self) -> list[dict]:
         rows = self._conn().execute("SELECT * FROM accounts WHERE enabled=1 ORDER BY id").fetchall()
         return [c for c in (self._row_to_config(r) for r in rows) if c]
@@ -216,6 +241,15 @@ class AdminStore:
     _LOG_COLS = ("ts", "ip", "method", "path", "model", "stream", "status", "latency_ms", "ttfb_ms", "account",
                  "auth", "prompt_tokens", "cached_tokens", "completion_tokens", "usage_reported",
                  "error_code", "error_message", "thread_reuse")
+    # effort / cap telemetry (nullable, added by ALTER on startup)
+    _EXTRA_COLS = (("effort_req", "TEXT"), ("effort_final", "TEXT"), ("client_max_tokens", "INTEGER"),
+                   ("has_tools", "INTEGER"), ("n_tools", "INTEGER"), ("ask_chars", "INTEGER"),
+                   ("long_gen_match", "INTEGER"), ("conv_key", "TEXT"), ("silent_close", "INTEGER"),
+                   ("silent_close_secs", "INTEGER"), ("hedge_winner", "TEXT"), ("hedge_effort", "TEXT"),
+                   ("notion_output_tokens", "INTEGER"), ("cap_memory", "TEXT"), ("would_downgrade", "INTEGER"),
+                   ("cache_write_tokens", "INTEGER"), ("uncached_input_tokens", "INTEGER"),
+                   ("prev_prompt_tokens", "INTEGER"), ("prompt_shrink", "INTEGER"))
+    _LOG_COLS = _LOG_COLS + tuple(c for c, _ in _EXTRA_COLS)
 
     def _writer(self) -> None:
         last_purge = 0.0

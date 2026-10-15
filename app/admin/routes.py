@@ -120,7 +120,7 @@ async def list_accounts(request: Request, _: dict = Depends(require_session)):
     pool = request.app.state.account_pool
     cooling = pool.cooling_map()
     status = pool.status_map()
-    items = _store(request).list_accounts()
+    items = await asyncio.to_thread(_store(request).list_accounts)
     for a in items:
         a["in_pool"] = a["id"] in cooling
         a["cooling_seconds"] = cooling.get(a["id"], 0)
@@ -238,6 +238,15 @@ async def account_credits(acc_id: int, request: Request, _: dict = Depends(requi
     if status != 200:
         raise HTTPException(502, f"Notion returned HTTP {status}")
     credits = _pick_credits(body)
+    # rolling (6h) + monthly usage window: read-only, never the one-time free reset
+    from app import usage_monitor
+    try:
+        st = await asyncio.to_thread(usage_monitor.fetch_status, client)
+    except Exception:
+        st = None
+    if st:
+        credits["rateLimit"] = st
+        usage_monitor.apply(request.app.state.account_pool, client, st)
     _store(request).set_credits(acc_id, credits)
     if credits.get("isEligible") is False:
         pool = request.app.state.account_pool
@@ -250,15 +259,16 @@ async def account_credits(acc_id: int, request: Request, _: dict = Depends(requi
 async def overview(request: Request, _: dict = Depends(require_session)):
     st = _store(request)
     pool = request.app.state.account_pool
-    accs = st.list_accounts()
-    s1 = st.stats(days=1)
-    s7 = st.stats(days=7)
+    accs = await asyncio.to_thread(st.list_accounts)
+    s1 = await asyncio.to_thread(st.stats, days=1)
+    s7 = await asyncio.to_thread(st.stats, days=7)
+    recent = await asyncio.to_thread(st.list_requests, limit=10, status="error")
     return {
         "accounts": {"total": len(accs), "enabled": sum(1 for a in accs if a["enabled"]), **pool.get_status_summary()},
         "last_24h": s1["totals"],
         "last_7d": s7["totals"],
         "by_day": s7["by_day"],
-        "recent_errors": st.list_requests(limit=10, status="error")["items"],
+        "recent_errors": recent["items"],
         "uptime": int(time.time() - request.app.state.start_time),
         "mode": getattr(request.app.state, "mode", ""),
     }
@@ -268,10 +278,142 @@ async def overview(request: Request, _: dict = Depends(require_session)):
 async def requests_log(request: Request, limit: int = 50, offset: int = 0, model: str = "", account: str = "",
                        status: str = "", _: dict = Depends(require_session)):
     limit = max(1, min(limit, 200))
-    return _store(request).list_requests(limit=limit, offset=max(0, offset), model=model, account=account,
+    return await asyncio.to_thread(_store(request).list_requests, limit=limit, offset=max(0, offset), model=model, account=account,
                                          status=status)
 
 
 @router.get("/stats")
 async def stats(request: Request, days: int = 7, _: dict = Depends(require_session)):
-    return _store(request).stats(days=max(1, min(days, 30)))
+    return await asyncio.to_thread(_store(request).stats, days=max(1, min(days, 30)))
+
+
+# ---------------- Notion e-mail login (server-side token capture) ----------------
+from app.admin import notion_login as nl
+
+_login_flows = nl.LoginFlows()
+
+
+def _owner(sess: dict) -> str:
+    return str(sess.get("id_hash") or sess.get("csrf") or "")
+
+
+class LoginStartBody(BaseModel):
+    email: str = Field(max_length=254)
+
+
+class LoginVerifyBody(BaseModel):
+    flow_id: str = Field(max_length=64)
+    code: str = Field(max_length=64)
+
+
+class LoginCommitBody(BaseModel):
+    flow_id: str = Field(max_length=64)
+    space_id: Optional[str] = Field(default=None, max_length=100)
+    label: Optional[str] = Field(default=None, max_length=200)
+
+
+def _login_err(e: "nl.LoginError"):
+    return JSONResponse({"error": str(e)}, status_code=e.status)
+
+
+@router.post("/notion-login/start")
+async def notion_login_start(request: Request, body: LoginStartBody, sess: dict = Depends(require_session)):
+    """Ask Notion to e-mail a one-time login code to the account."""
+    _store(request)
+    try:
+        return await asyncio.to_thread(_login_flows.start, body.email, _owner(sess))
+    except nl.LoginError as e:
+        return _login_err(e)
+
+
+@router.post("/notion-login/verify")
+async def notion_login_verify(request: Request, body: LoginVerifyBody, sess: dict = Depends(require_session)):
+    """Complete loginWithEmail; token_v2 is captured server-side and never returned."""
+    try:
+        return await asyncio.to_thread(_login_flows.verify, body.flow_id, body.code, _owner(sess))
+    except nl.LoginError as e:
+        return _login_err(e)
+
+
+@router.post("/notion-login/commit")
+async def notion_login_commit(request: Request, body: LoginCommitBody, sess: dict = Depends(require_session)):
+    """Save the captured account (new) or refresh token_v2 of the existing same space/user."""
+    st = _store(request)
+    try:
+        acc = _login_flows.take(body.flow_id, _owner(sess), body.space_id)
+    except nl.LoginError as e:
+        return _login_err(e)
+    existing = await asyncio.to_thread(st.find_account_id, acc["space_id"], acc["user_id"])
+    if existing:
+        await asyncio.to_thread(st.update_account, existing, token_v2=acc["token_v2"],
+                                label=body.label or None)
+        acc_id, action = existing, "updated"
+    else:
+        label = body.label or acc.get("user_email") or ""
+        acc_id = await asyncio.to_thread(st.add_account, acc, label)
+        action = "added"
+    acc.clear()
+    _reload_pool(request)
+    logger.info("Notion account login captured", extra={"request_info": {"event": "notion_login", "account_id": acc_id,
+                                                                         "action": action}})
+    return {"ok": True, "id": acc_id, "action": action}
+
+
+@router.post("/notion-login/cancel")
+async def notion_login_cancel(request: Request, body: LoginVerifyBody, sess: dict = Depends(require_session)):
+    return {"ok": _login_flows.cancel(body.flow_id, _owner(sess))}
+
+
+# ---------------- quota estimate (sub2api-style) ----------------
+QUOTA_REFRESH_INTERVAL = 60
+
+
+def _quota_payload(request: Request) -> dict:
+    from app import quota_estimate as qe
+    st = _store(request)
+    accs = []
+    for a in st.list_accounts():
+        if not a.get("enabled"):
+            continue
+        accs.append({"id": a["id"], "label": a.get("label") or "",
+                     "rate_limit": (a.get("credits") or {}).get("rateLimit")})
+    return qe.estimate(accs, st.account_cost_since, st.account_first_log_ts)
+
+
+@router.get("/quota")
+async def quota(request: Request, _: dict = Depends(require_session)):
+    """Cached quota % + $ estimate per account and pool (no Notion call)."""
+    return await asyncio.to_thread(_quota_payload, request)
+
+
+@router.post("/quota/refresh")
+async def quota_refresh(request: Request, _: dict = Depends(require_session)):
+    """Re-read getCreditRateLimitStatus (read-only, no model call) for every enabled account."""
+    wait = _rate_limit("quota", 0, QUOTA_REFRESH_INTERVAL)
+    if wait:
+        return JSONResponse({"error": "rate limited", "retry_after": wait}, status_code=429)
+    from app import usage_monitor
+    st = _store(request)
+    pool = request.app.state.account_pool
+    refreshed = 0
+    for a in await asyncio.to_thread(st.list_accounts):
+        if not a.get("enabled"):
+            continue
+        try:
+            client = _client_for(request, a["id"])
+            s = await asyncio.to_thread(usage_monitor.fetch_status, client)
+        except Exception:
+            s = None
+        if not s:
+            continue
+        credits = dict(a.get("credits") or {})
+        credits["rateLimit"] = s
+        await asyncio.to_thread(st.set_credits, a["id"], credits)
+        try:
+            usage_monitor.apply(pool, client, s)
+        except Exception:
+            pass
+        refreshed += 1
+    out = await asyncio.to_thread(_quota_payload, request)
+    out["refreshed"] = refreshed
+    return out
