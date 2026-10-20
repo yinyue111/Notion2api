@@ -18,6 +18,8 @@ accounts.json
 
 # Data & Database
 data/
+*.sqlite
+*.sqlite3
 *.db
 *.db-shm
 *.db-wal
@@ -51,10 +53,7 @@ tmp_*.log
 *.tmp
 *.old
 
-# Test files (all tests directory)
-tests/
-test_*.py
-*_test.py
+# Debug scripts
 debug_*.py
 
 # Claude Code local settings
@@ -70,3 +69,8 @@ docker-compose.override.yml
 
 # Response debug data (contains sensitive tokens)
 response/
+
+# Build artifacts / local
+*.tar
+*.tar.gz
+.pytest_cache/

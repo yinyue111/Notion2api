@@ -26,6 +26,7 @@
     <nav>
       <a data-page="overview" href="#overview"><span class="nav-ico">📊</span><span>概览</span></a>
       <a data-page="accounts" href="#accounts"><span class="nav-ico">👤</span><span>账号</span></a>
+      <a data-page="keys" href="#keys"><span class="nav-ico">🔑</span><span>API Key</span></a>
       <a data-page="requests" href="#requests"><span class="nav-ico">📜</span><span>请求与用量</span></a>
       <a data-page="chat" href="#chat"><span class="nav-ico">💬</span><span>对话</span></a>
     </nav>
@@ -37,13 +38,52 @@
   </aside>
   <main>
     <section id="page-overview" class="page">
-      <h1>概览</h1>
-      <p class="page-sub">账号池状态、近 24 小时 / 7 天用量与最近错误</p>
+      <div class="page-head">
+        <div>
+          <h1>概览</h1>
+          <p class="page-sub" style="margin-bottom:0">按时间范围统计用量；token 价值按各模型官方 API 标价折算（USD，时间均为 UTC+8）</p>
+        </div>
+        <button id="ov-refresh" class="btn small" type="button">刷新</button>
+      </div>
+      <div class="range-bar">
+        <div class="seg" id="ov-presets">
+          <button type="button" data-r="today">今天</button>
+          <button type="button" data-r="yesterday">昨天</button>
+          <button type="button" data-r="7d">近7天</button>
+          <button type="button" data-r="30d">近30天</button>
+          <button type="button" data-r="month">本月</button>
+          <button type="button" data-r="all">全部</button>
+        </div>
+        <div class="range-custom">
+          <input type="datetime-local" id="ov-start" aria-label="开始（UTC+8）">
+          <span class="muted">→</span>
+          <input type="datetime-local" id="ov-end" aria-label="结束（UTC+8）">
+          <button id="ov-apply" class="btn small" type="button">自定义</button>
+        </div>
+        <span id="ov-range-label" class="muted small"></span>
+      </div>
       <div id="ov-cards" class="cards"></div>
-      <h2>近 7 天</h2>
-      <div class="table-wrap"><table id="ov-days"></table></div>
-      <h2>最近错误</h2>
+      <p id="ov-value-note" class="muted small"></p>
+      <h2 id="ov-time-title">趋势</h2>
+      <div class="table-wrap"><table id="ov-time"></table></div>
+      <h2>按模型 <span class="muted small">（按请求时的模型名计价；Notion 实际可能换用其他模型）</span></h2>
+      <div class="table-wrap"><table id="ov-models"></table></div>
+      <h2>按账号</h2>
+      <div class="table-wrap"><table id="ov-accounts"></table></div>
+      <h2>按 API Key</h2>
+      <div class="table-wrap"><table id="ov-keys"></table></div>
+      <h2>错误</h2>
+      <div id="ov-errcodes" class="chips"></div>
       <div class="table-wrap"><table id="ov-errors"></table></div>
+      <details id="ov-prices-box" class="prices-box">
+        <summary>官方价格表 <span id="ov-prices-meta" class="muted small"></span></summary>
+        <div class="actions" style="margin:10px 0">
+          <button id="pr-edit" class="btn small" type="button">编辑 JSON</button>
+          <button id="pr-reset" class="btn small danger" type="button">恢复默认</button>
+        </div>
+        <div class="table-wrap"><table id="pr-table"></table></div>
+        <p class="muted small">单位：USD / 百万 token。缓存写入 = 5 分钟缓存写入价；无单独写入价的厂商按普通输入价。长上下文：整次请求的 prompt（未缓存+缓存读+缓存写）达到阈值时，该请求全部 token 用高价。DeepSeek 列表价为高峰价，非高峰时段按 50%。价格表保存在 data/official_prices.json，可直接改文件（自动重载）。</p>
+      </details>
     </section>
 
     <section id="page-accounts" class="page">
@@ -68,6 +108,19 @@
       <p id="q-note" class="muted small"></p>
     </section>
 
+    <section id="page-keys" class="page">
+      <div class="page-head">
+        <div>
+          <h1>API Key 与模型权限</h1>
+          <p class="page-sub" style="margin-bottom:0">为每个客户端单独发 Key，并限定它能用的模型；修改即时生效</p>
+        </div>
+        <div class="actions"><button id="key-add-btn" class="btn primary" type="button">＋ 新建 Key</button></div>
+      </div>
+      <div id="key-banner" class="hint-banner"></div>
+      <div class="table-wrap"><table id="key-table"></table></div>
+      <p class="muted small">只保存 Key 的 SHA-256：明文只在新建 / 重新生成时显示一次。未勾选的模型返回 403 <code>model_not_allowed</code>（不消耗 Notion），<code>/v1/models</code> 只列出允许的模型；停用或过期的 Key 返回 401。统计来自请求日志（保留 30 天）。</p>
+    </section>
+
     <section id="page-requests" class="page">
       <div class="page-head">
         <div>
@@ -87,6 +140,7 @@
         <div class="filters">
           <select id="rq-status"><option value="">全部</option><option value="ok">成功</option><option value="error">错误</option></select>
           <input id="rq-model" placeholder="模型">
+          <input id="rq-auth" placeholder="鉴权（如 key:gpt-sol）">
           <button id="rq-refresh" class="btn small" type="button">刷新</button>
         </div>
       </div>
@@ -132,7 +186,54 @@
     <div class="row-end"><button id="nl-cancel" value="cancel" class="btn ghost" formnovalidate type="submit">取消</button><button id="nl-next" class="btn primary" type="button">发送验证码</button></div>
   </form>
 </dialog>
+<dialog id="key-dialog" class="wide">
+  <form id="key-form" method="dialog">
+    <h2 id="key-dialog-title">新建 Key</h2>
+    <label>名称<input name="name" maxlength="64" required placeholder="例如：new-api-gpt、某某客户端"></label>
+    <label>备注（可选）<input name="note" maxlength="500" placeholder="给谁用、配在哪个渠道"></label>
+    <div class="key-row">
+      <label>过期时间（可选）<input name="expires" type="datetime-local"></label>
+      <label class="chk-inline"><input name="enabled" type="checkbox" checked> 启用</label>
+    </div>
+    <label class="new-only">自定义 Key（可选，留空自动生成 sk-n2a-…，至少 16 位）<input name="custom_key" type="password" autocomplete="off" maxlength="200"></label>
+    <div class="models-box">
+      <div class="models-head">
+        <label class="chk-inline strong"><input name="all_models" type="checkbox"> 全部模型（不限制，含以后新增的模型）</label>
+        <div class="models-tools">
+          <input id="key-model-filter" placeholder="筛选模型">
+          <button type="button" class="btn small" data-fam="claude">Claude</button>
+          <button type="button" class="btn small" data-fam="gpt">GPT</button>
+          <button type="button" class="btn small" data-fam="gemini">Gemini</button>
+          <button type="button" class="btn small" data-fam="other">其他</button>
+          <button type="button" class="btn small" data-fam="*">全选</button>
+          <button type="button" class="btn small ghost" data-fam="none">清空</button>
+        </div>
+      </div>
+      <div id="key-models" class="models-grid"></div>
+      <div id="key-models-count" class="muted small"></div>
+    </div>
+    <div class="err" id="key-err"></div>
+    <div class="row-end"><button value="cancel" class="btn ghost" formnovalidate type="submit">取消</button><button id="key-save" value="ok" class="btn primary" type="submit">保存</button></div>
+  </form>
+</dialog>
+<dialog id="key-secret-dialog">
+  <form method="dialog">
+    <h2>请立即复制这个 Key</h2>
+    <p class="muted small hint">出于安全只保存哈希，关闭后无法再次查看；丢失只能重新生成。</p>
+    <div class="secret-box"><code id="key-secret"></code></div>
+    <div class="row-end"><button id="key-copy" class="btn" type="button">复制</button><button value="ok" class="btn primary" type="submit">我已保存</button></div>
+  </form>
+</dialog>
 <div id="toast"></div>
+<dialog id="pr-dialog" class="wide">
+  <form id="pr-form" method="dialog">
+    <h2>编辑官方价格表（JSON）</h2>
+    <p class="muted small hint">每个模型：input / output / cache_read / cache_write（USD/百万 token）；可选 long_context {min_prompt_tokens, input, output, cache_read, cache_write}、offpeak {factor, peak_utc_hours, peak_weekdays}、unpriced:true、name、source、checked、note。</p>
+    <textarea id="pr-json" class="code-area" spellcheck="false" rows="22"></textarea>
+    <div class="err" id="pr-err"></div>
+    <div class="row-end"><button value="cancel" class="btn ghost" formnovalidate type="submit">取消</button><button id="pr-save" value="ok" class="btn primary" type="submit">保存</button></div>
+  </form>
+</dialog>
 <script src="/admin.js"></script>
 </body>
 </html>

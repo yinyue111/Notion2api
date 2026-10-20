@@ -132,6 +132,52 @@ def mark(keys, reason=""):
                 _mem.pop(k, None)
 
 
+_faster: dict = {}  # conv key -> {"n": consecutive hedge-faster wins, "ts": last}
+
+
+def faster_n() -> int:
+    """NOTION_CAP_MEMORY_FASTER_N (default 2; 0 = off): after this many CONSECUTIVE turns of
+    a conversation where the lower-effort hedge answered first while the xhigh/max original
+    was still running, the conversation is treated like a cap (mark -> forced high turns,
+    probe every NOTION_CAP_MEMORY_PROBE, TTL NOTION_CAP_MEMORY_TTL)."""
+    try:
+        return max(0, int(os.getenv("NOTION_CAP_MEMORY_FASTER_N", "2") or 0))
+    except ValueError:
+        return 2
+
+
+def note_hedge_faster(keys) -> int:
+    """Count a hedge-faster win; marks the conversation at faster_n(). -> streak (0 = off)."""
+    keys = [k for k in (keys or []) if k]
+    n_req = faster_n()
+    if not enabled() or not keys or n_req <= 0:
+        return 0
+    now = time.time()
+    with _lock:
+        cur = 0
+        for k in keys:
+            e = _faster.get(k)
+            if e and now - e["ts"] <= ttl():
+                cur = max(cur, e["n"])
+        cur += 1
+        for k in keys:
+            _faster[k] = {"n": cur, "ts": now}
+        if len(_faster) > 5000:
+            for k in [k for k, v in _faster.items() if now - v["ts"] > ttl()]:
+                _faster.pop(k, None)
+    if cur >= n_req:
+        mark(keys, reason=f"hedge_faster_x{cur}")
+        reset_faster(keys)
+    return cur
+
+
+def reset_faster(keys) -> None:
+    """Streak broken (original answered first / turn without silent close / marked)."""
+    with _lock:
+        for k in keys or []:
+            _faster.pop(k, None)
+
+
 def alias(keys, new_key):
     """Register another key (e.g. reused Notion thread id) for an existing entry."""
     if not new_key:
@@ -161,6 +207,7 @@ def state(keys):
 def clear():
     with _lock:
         _mem.clear()
+        _faster.clear()
 
 
 def has_write_tool(tools) -> bool:

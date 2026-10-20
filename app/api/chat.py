@@ -43,6 +43,7 @@ class _UsageCollector:
         self.include_usage = include_usage
         self.raw: dict[str, int] | None = None
         self.error: str | None = None
+        self.first_content_ts: float | None = None
         _request_log_annotate(_collector=self, account=account or None)
 
     def __iter__(self):
@@ -62,6 +63,9 @@ class _UsageCollector:
                 if isinstance(usage, dict):
                     self.raw = dict(usage)
                 continue
+            if self.first_content_ts is None and isinstance(item, dict) and \
+                    item.get("type") in ("content", "thinking", "final_content") and str(item.get("text") or "").strip():
+                self.first_content_ts = time.time()  # true first Notion content (request_log)
             return item
 
     def close(self):
@@ -102,11 +106,25 @@ def _openai_usage_from_raw(raw: dict[str, int] | None) -> dict[str, Any]:
     }
     if "cachedTokensRead" in raw:
         usage["prompt_tokens_details"] = {"cached_tokens": int(raw["cachedTokensRead"])}
+    cw = int(raw.get("cachedTokensCreated", 0) or 0)
+    if cw > 0 and os.getenv("NOTION_USAGE_CACHE_WRITE", "on").strip().lower() not in ("0", "off", "false", "no"):
+        # OpenAI-native cache-write count (new-api bills it at the cache-creation price and
+        # subtracts it from prompt_tokens, which stays the all-inclusive total)
+        usage.setdefault("prompt_tokens_details", {"cached_tokens": 0})["cache_write_tokens"] = cw
     return usage
 
 
 def _openai_usage(stream_gen: Any) -> dict[str, Any]:
     return _openai_usage_from_raw(getattr(stream_gen, "raw", None))
+
+
+def _reuse_target(meta: dict):
+    """(thread_id, account) the next turn's sticky reuse should continue on: the winning
+    effort hedge's thread when the hedge delivered the answer (NOTION_HEDGE_REUSE_WINNER),
+    else the dispatched thread."""
+    if meta.get("_reuse_thread_id") and meta.get("_reuse_account"):
+        return meta["_reuse_thread_id"], meta["_reuse_account"]
+    return meta.get("thread_id"), meta.get("account")
 
 
 def _include_usage_flag(req_body: Any) -> bool:
@@ -142,6 +160,16 @@ def _stream_error_hint(exc: BaseException) -> str:
 def _classify_upstream_error(exc: NotionUpstreamError) -> dict[str, Any]:
     """将 NotionUpstreamError 分类为结构化错误信息，前端可直接展示。"""
     sc = exc.status_code
+
+    if getattr(exc, "code", "") in ("EMPTY_STREAM", "EMPTY_STREAM_BREAKER"):
+        return {"code": exc.code, "type": "upstream_error", "message": str(exc),
+                "suggestion": "请重试；若反复出现请把任务拆小", "status": 502}
+    if getattr(exc, "code", "") == "SUPERSEDED_DUPLICATE":
+        return {"code": exc.code, "type": "request_superseded", "message": str(exc),
+                "suggestion": "该请求已被同一内容的新请求取代", "status": 409}
+    if getattr(exc, "code", "") == "UPSTREAM_TRUNCATED":
+        return {"code": "UPSTREAM_TRUNCATED", "type": "upstream_error", "message": str(exc),
+                "suggestion": "请重新发送或回复“继续”", "status": 502}
 
     notion_msg = getattr(exc, "notion_error_message", "")
     if notion_msg:
@@ -1072,6 +1100,53 @@ def _last_user_ask(messages) -> str:
         return ""
 
 
+_SUGGESTION_RE = re.compile(r"^\s*\[SUGGESTION MODE:", re.I)
+
+
+# Usage reported on the wire for locally answered requests. All-zero usage is treated as
+# "missing" by new-api, which then bills its own prompt estimate (~180k tokens for a
+# suggestion side request); one token keeps the gateway charge ~0. request_log keeps 0.
+_LOCAL_REPLY_USAGE = {"prompt_tokens": 1, "completion_tokens": 0, "total_tokens": 1}
+
+
+def _suggestion_mode_reply(messages_all, req_body, response_id):
+    """Claude Code's prompt-suggestion side request ("[SUGGESTION MODE: Suggest what the
+    user might naturally type next ...] ... Or nothing."). Sent with the full main
+    conversation, it continued the main Notion thread and replaced its reuse entry, so the
+    next real turn missed (nomatch) and re-sent the whole history (~220k tokens) on a fresh
+    thread. NOTION_SUGGESTION_MODE=skip (default) answers "nothing" locally (no Notion
+    call); =passthrough restores the old behaviour."""
+    if os.getenv("NOTION_SUGGESTION_MODE", "skip").strip().lower() != "skip":
+        return None
+    ask = _last_user_ask(messages_all)
+    if not ask or not _SUGGESTION_RE.match(ask):
+        return None
+    try:
+        from app.request_log import annotate as _rl_annotate
+        _rl_annotate(thread_reuse="local:suggestion", completion_tokens=0, prompt_tokens=0, account="local")
+    except Exception:
+        pass
+    logger.info("Suggestion-mode side request answered locally", extra={"request_info": {
+        "event": "suggestion_mode_skip", "ask_chars": len(ask)}})
+    model = req_body.model
+    if req_body.stream:
+        def _gen():
+            yield _build_stream_chunk(response_id, model, role="assistant", content="")
+            yield _build_stream_chunk(response_id, model, finish_reason="stop")
+            if _include_usage_flag(req_body):
+                yield "data: " + json.dumps({"id": response_id, "object": "chat.completion.chunk",
+                                             "created": int(time.time()), "model": model, "choices": [],
+                                             "usage": dict(_LOCAL_REPLY_USAGE)}) + "\n\n"
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(_gen(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    return JSONResponse({
+        "id": response_id, "object": "chat.completion", "created": int(time.time()), "model": model,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": ""}, "finish_reason": "stop", "logprobs": None}],
+        "usage": dict(_LOCAL_REPLY_USAGE),
+    })
+
+
 def _tick_iter(it, every: float = 5.0, on_stop=None):
     """Yield items from `it`, plus _TICK whenever nothing arrived for `every` seconds.
     The upstream is consumed in a worker thread so ticks flow even while Notion is
@@ -1142,7 +1217,8 @@ def _lowered_effort(transcript):
                 and str(b["value"].get("reasoningEffort") or "").lower() in ("high", "xhigh", "max"):
             logger.info("Retrying with lower reasoning effort", extra={"request_info": {
                 "event": "effort_lowered", "from": b["value"].get("reasoningEffort"), "to": "medium"}})
-            b = {**b, "value": {**b["value"], "reasoningEffort": "medium"}}
+            from app.notion_client import mark_rescue_effort
+            b = mark_rescue_effort(b, "medium")  # deliberate rescue effort: no NOTION_EFFORT_FLOOR
         out.append(b)
     return out
 
@@ -1154,6 +1230,11 @@ def _abort_upstream(meta) -> None:
     if not isinstance(meta, dict):
         return
     meta["_cancelled"] = True
+    try:  # stop the run server-side too (closing our socket does not stop Notion)
+        from app.notion_client import interrupt_meta
+        interrupt_meta(meta, "client_gone")
+    except Exception:
+        pass
     resp = meta.get("_http_response")
     if resp is None:
         return
@@ -1166,6 +1247,97 @@ def _abort_upstream(meta) -> None:
     except Exception:
         pass
     logger.info("Client gone: aborted in-flight Notion stream", extra={"request_info": {"event": "upstream_aborted"}})
+
+
+TRUNC_CODE = "UPSTREAM_TRUNCATED"
+TRUNC_MESSAGE = "Notion 上游输出在工具调用中途被截断（已自动重试仍失败），请重试"
+
+
+def _trunc_max() -> int:
+    """NOTION_TOOL_TRUNC_RETRIES (default 2): extra attempts for a turn whose output
+    stopped inside a <tool_call> block."""
+    try:
+        return max(0, int(os.getenv("NOTION_TOOL_TRUNC_RETRIES", "2") or 0))
+    except ValueError:
+        return 2
+
+
+def _trunc_rescue_on() -> bool:
+    """NOTION_TOOL_TRUNC_RESCUE (default on): first re-read this inference from the Notion
+    thread record (complete text, no extra credits) before re-running the turn."""
+    return os.getenv("NOTION_TOOL_TRUNC_RESCUE", "1").strip().lower() not in ("0", "false", "off", "no")
+
+
+def _note_truncation(meta, **kw) -> None:
+    try:
+        from app.request_log import annotate_meta as _am
+        _am(meta, **kw)
+    except Exception:
+        pass
+
+
+def _truncated_error_event() -> str:
+    err = {"message": TRUNC_MESSAGE, "type": "upstream_error", "code": TRUNC_CODE, "status": 502}
+    return f"data: {json.dumps({'error': err}, ensure_ascii=False)}\n\n"
+
+
+def _truncated_exc() -> NotionUpstreamError:
+    exc = NotionUpstreamError(TRUNC_MESSAGE, status_code=502, retriable=False)
+    exc.code = TRUNC_CODE
+    return exc
+
+
+def _dump_raw_tail(meta, reason: str) -> None:
+    """Persist the bounded raw NDJSON tail of this attempt (NOTION_TRUNC_RAW_CAPTURE) for
+    parser forensics; newest NOTION_TRUNC_RAW_KEEP files are kept in /app/data/rawdump."""
+    tail = (meta or {}).get("_raw_tail")
+    if not tail:
+        return
+    try:
+        d = os.getenv("NOTION_TRUNC_RAW_DIR", "/app/data/rawdump")
+        os.makedirs(d, exist_ok=True)
+        name = "%s-%s-%s.ndjson" % (time.strftime("%Y%m%d-%H%M%S"), reason, str((meta or {}).get("trace_id") or "x")[:8])
+        with open(os.path.join(d, name), "w", encoding="utf-8") as fh:
+            for ln in list(tail):
+                fh.write(ln + "\n")
+        os.chmod(os.path.join(d, name), 0o600)
+        keep = max(1, int(os.getenv("NOTION_TRUNC_RAW_KEEP", "20") or 20))
+        files = sorted(f for f in os.listdir(d) if f.endswith(".ndjson"))
+        for f in files[:-keep]:
+            try:
+                os.remove(os.path.join(d, f))
+            except OSError:
+                pass
+        logger.info("Raw stream tail saved", extra={"request_info": {"event": "raw_tail_saved", "file": name, "lines": len(tail)}})
+    except Exception as exc:  # noqa: BLE001 - diagnostics only
+        logger.info("Raw stream tail save failed", extra={"request_info": {"event": "raw_tail_save_failed", "error": str(exc)[:200]}})
+
+
+def _rescue_from_record(client, meta):
+    """Generator: yields "tick" (keepalive) while it waits, then ("text", str) with this
+    request's own inference (matched by traceId) re-read from the Notion thread record."""
+    tid = (meta or {}).get("thread_id")
+    trace = (meta or {}).get("trace_id")
+    if not tid or not trace or not hasattr(client, "inference_text_by_trace"):
+        yield ("text", "")
+        return
+    for w in (0.0, 1.5, 3.0):
+        if (meta or {}).get("_cancelled"):
+            break
+        if w:
+            yield "tick"
+            time.sleep(w)
+        try:
+            text, finished = client.inference_text_by_trace(tid, trace)
+        except Exception as exc:  # noqa: BLE001 - diagnostics only
+            logger.info("Truncation rescue: record read failed", extra={"request_info": {
+                "event": "tool_trunc_rescue_error", "error": str(exc)[:200]}})
+            break
+        yield "tick"
+        if text and finished:
+            yield ("text", text)
+            return
+    yield ("text", "")
 
 
 def _sum_usage(a: dict | None, b: dict | None) -> dict | None:
@@ -1191,9 +1363,20 @@ def _run_tool_attempts(client, transcript, *, include_usage, account, tools, par
     if meta is None:
         meta = {}
     meta["_deadline"] = deadline
+    meta["_live_end"] = _live_end()
+    meta["_budget_end"] = deadline  # whole-request budget end (ghost guard: no-text polling cap)
     lower_effort = False
+    from app.workspaces import transcript_model as _tmodel
+    _req_model = _tmodel(transcript)
     tried = {getattr(client, "account_key", "")}
-    for attempt in range(1, TOOL_MODE_MAX_ATTEMPTS + 1):
+    from app.tool_emulation import open_tag_index, strip_tool_markup, trunc_fix_enabled
+    _trunc_on = trunc_fix_enabled()
+    trunc_max = _trunc_max() if _trunc_on else 0
+    trunc_used = 0
+    nothing_parsed = 0
+    for attempt in range(1, TOOL_MODE_MAX_ATTEMPTS + trunc_max + 1):
+        if attempt > TOOL_MODE_MAX_ATTEMPTS + trunc_used:
+            break  # attempts beyond the normal cap are only for truncation retries
         if meta.get("_cancelled"):
             return  # client gone: no result
         if attempt > 1 and deadline and time.time() > deadline - 60:
@@ -1202,6 +1385,24 @@ def _run_tool_attempts(client, transcript, *, include_usage, account, tools, par
             break
         if deadline:  # leave room for one failover retry after the first attempt
             meta["_deadline"] = deadline - 150 if attempt == 1 else deadline
+        if attempt > 1 and pool is not None and client is not None:
+            from app.account_pool import is_exhausted as _lg_exh, limit_guard as _lg_on
+            if _lg_on() and _lg_exh(client) and _other_account_free(pool, client, _req_model):
+                # this account went over its usage limit mid-request: never retry on it;
+                # fresh thread with the full transcript on another account
+                try:
+                    _lg_new = _pool_get(pool, True, tried, model=_req_model)
+                except Exception:
+                    _lg_new = None
+                if _lg_new is not None and _lg_new is not client:
+                    logger.info("Limit guard: failing over from over-limit account", extra={"request_info": {
+                        "event": "limit_guard_failover", "path": "tool_retry", "from": getattr(client, "account_key", ""),
+                        "to": getattr(_lg_new, "account_key", ""), "attempt": attempt}})
+                    client = _lg_new
+                    tried.add(getattr(client, "account_key", ""))
+                    account = getattr(client, "account_label", "") or getattr(client, "account_key", "")
+                    thread_id = None
+                    meta.pop("_same_thread_502_keep", None)
         # fresh block ids per attempt: Notion rejects re-sent ids (400 ValidationError / 502)
         # Same-thread 502 short-retry keeps the continued transcript; other retries use full.
         _same_keep = bool(meta.get("_same_thread_502_keep"))
@@ -1227,7 +1428,7 @@ def _run_tool_attempts(client, transcript, *, include_usage, account, tools, par
         got_items = 0
         try:
           try:
-              for raw_item in _tick_iter(collector, on_stop=lambda m=meta: _abort_upstream(m)):
+              for raw_item in _tick_iter(collector, every=_heartbeat_secs(), on_stop=lambda m=meta: _abort_upstream(m)):
                   if raw_item is _TICK:
                       yield "tick"
                       continue
@@ -1238,6 +1439,7 @@ def _run_tool_attempts(client, transcript, *, include_usage, account, tools, par
                       content.append(item["text"])
                   elif typ == "thinking" and item.get("text"):
                       thinking.append(item["text"])
+                      yield {"_think": item["text"]}  # live reasoning for streaming clients
                   elif typ == "final_content":
                       ft = str(item.get("text", "") or "").strip()
                       if ft:
@@ -1249,6 +1451,9 @@ def _run_tool_attempts(client, transcript, *, include_usage, account, tools, par
                   exc.retriable and (exc.status_code or 0) == 502 and thread_id
                   and not meta.get("_same_thread_502_retried") and not got_items
                   and not meta.get("_cancelled")
+                  # a ghost verdict (capped / no text) already gave up on (and stopped,
+                  # archived) this thread: re-running it there only races that
+                  and not meta.get("_ghost")
               )
               if same_tid_retry:
                   meta["_same_thread_502_retried"] = True
@@ -1276,16 +1481,22 @@ def _run_tool_attempts(client, transcript, *, include_usage, account, tools, par
                   # rest this account and fail over to another free one. Retrying the same
                   # account only works for one-off glitches, so do that only when alone.
                   can_failover = (exc.retriable and pool is not None and attempt < TOOL_MODE_MAX_ATTEMPTS
-                                  and _other_account_free(pool, client))
+                                  and _other_account_free(pool, client, _req_model))
                   if exc.status_code in (429, 503) and not can_failover:
                       raise
                   if can_failover:
+                      try:
+                          from app.notion_client import interrupt_meta
+                          interrupt_meta(meta, "failover")  # previous attempt's run, if still alive
+                      except Exception:
+                          pass
                       rl = exc.status_code in (429, 503)
                       pool.mark_failed(client, cooldown_seconds=int(os.getenv("NOTION_RATELIMIT_FAILOVER_COOLDOWN", "45") or 45) if rl else 3)
-                      new_client = pool.get_client(True, tried)
+                      new_client = _pool_get(pool, True, tried, model=_req_model)
                       logger.info("Rate-limited: failing over to another account", extra={"request_info": {
                           "event": "ratelimit_failover", "mode": "tool", "from": getattr(client, "account_key", ""),
-                          "to": getattr(new_client, "account_key", ""), "status": exc.status_code}})
+                          "to": getattr(new_client, "account_key", ""), "status": exc.status_code,
+                          "reason": str(exc)[:160], "excerpt": str(getattr(exc, "response_excerpt", "") or "")[:200]}})
                       client = new_client
                       tried.add(getattr(client, "account_key", ""))
                       account = getattr(client, "account_label", "") or getattr(client, "account_key", "")
@@ -1318,19 +1529,76 @@ def _run_tool_attempts(client, transcript, *, include_usage, account, tools, par
             if calls:
                 break
         text = visible if calls else (streamed if streamed.strip() else best)
+        _thinking_txt = "".join(thinking)
+        _note_truncation(meta, content_chars=len(streamed), thinking_chars=len(_thinking_txt),
+                         final_source=(final_src or None), final_len=len(final_text) if final_text else 0)
+        if not calls and _trunc_on and open_tag_index(text) != -1:
+            # The turn stopped inside a <tool_call> block ('<tool_call>\n{"'): never return
+            # the partial markup as the answer (finish_reason=stop ends the client's agent
+            # loop). 1) re-read the complete inference from the thread record, 2) re-run
+            # the turn (fresh thread; no tool was executed), 3) else surface an error.
+            nothing_parsed += 1
+            _note_truncation(meta, nothing_parsed=nothing_parsed)
+            _dump_raw_tail(meta, "nothing_parsed")
+            rescued = ""
+            if _trunc_rescue_on():
+                for _rev in _rescue_from_record(client, meta):
+                    if _rev == "tick":
+                        yield "tick"
+                    else:
+                        rescued = _rev[1]
+            if rescued:
+                rv, rc = parse_tool_calls(rescued, tools, parallel)
+                logger.info("Truncated tool call: thread record re-read", extra={"request_info": {
+                    "event": "tool_trunc_rescue", "streamed_chars": len(streamed), "record_chars": len(rescued),
+                    "calls": len(rc), "attempt": attempt}})
+                if rc:
+                    visible, calls, text = rv, rc, rv
+                    _note_truncation(meta, trunc_rescue="record")
+            if not calls:
+                if trunc_used < trunc_max and not meta.get("_cancelled"):
+                    trunc_used += 1
+                    _note_truncation(meta, trunc_retry=trunc_used)
+                    logger.warning("Truncated tool call: retrying the turn", extra={"request_info": {
+                        "event": "tool_trunc_retry", "attempt": attempt, "retry": trunc_used,
+                        "streamed_chars": len(streamed), "account": account}})
+                    result = {"text": strip_tool_markup(text), "calls": [], "thinking": _thinking_txt,
+                              "attempts": attempt, "error": TRUNC_CODE}
+                    continue
+                logger.warning("Truncated tool call: giving up", extra={"request_info": {
+                    "event": "tool_trunc_giveup", "attempt": attempt, "retries": trunc_used}})
+                _note_truncation(meta, error_code=TRUNC_CODE, error_message=TRUNC_MESSAGE)
+                result = {"text": strip_tool_markup(text), "calls": [], "thinking": _thinking_txt,
+                          "attempts": attempt, "error": TRUNC_CODE}
+                break
         from app.meta_commentary import strip_meta_commentary
         text = strip_meta_commentary(text)
-        result = {"text": text, "calls": calls, "thinking": "".join(thinking), "attempts": attempt}
+        result = {"text": text, "calls": calls, "thinking": _thinking_txt, "attempts": attempt}
         if calls:
             break
+        if not text.strip() and meta.get("_ghost"):
+            # ghost run (thinking-only, no text by the budget / at Notion's output cap): one
+            # retry on another account + fresh thread only if the budget still has room
+            meta["_ghost_seen"] = meta.pop("_ghost")
+            left = (deadline - time.time()) if deadline else 1e9
+            logger.warning("Ghost run: no text from Notion", extra={"request_info": {
+                "event": "notion_ghost_run", "kind": meta["_ghost_seen"], "attempt": attempt,
+                "account": account, "left_s": round(left), "conv_keys": (meta.get("_conv_keys") or [])[:1]}})
+            if left < _ghost_retry_min_left():
+                break
         if not text.strip() and attempt < TOOL_MODE_MAX_ATTEMPTS:
             # an empty answer usually means the account's inference stalled: retry on
             # another free account (fresh thread) instead of the same one
-            if pool is not None and _other_account_free(pool, client):
+            if pool is not None and _other_account_free(pool, client, _req_model):
                 try:
                     pool.mark_failed(client)  # counts toward the account's failure streak
-                    new_client = pool.get_client(True, tried)
+                    new_client = _pool_get(pool, True, tried, model=_req_model)
                     if new_client is not client:
+                        try:
+                            from app.notion_client import interrupt_meta
+                            interrupt_meta(meta, "failover")
+                        except Exception:
+                            pass
                         logger.info("Empty answer: failing over to another account", extra={"request_info": {
                             "event": "empty_failover", "from": getattr(client, "account_key", ""),
                             "to": getattr(new_client, "account_key", "")}})
@@ -1354,8 +1622,64 @@ def _run_tool_attempts(client, transcript, *, include_usage, account, tools, par
                     extra={"request_info": {"event": "tool_mode_retry", "attempt": attempt, "refused": refused}})
     if collector is not None:
         collector.raw = total_raw  # report the sum of all attempts
+    if result is None:
+        result = {"text": "", "calls": [], "thinking": "", "attempts": 0}
+    _ghost_bookkeeping(meta, result)
     result["collector"] = collector
     yield ("done", result)
+
+
+EMPTY_CODE = "EMPTY_STREAM"
+EMPTY_MESSAGE = ("Notion 上游未产出任何内容（模型只在思考、耗尽了单次输出上限或超出请求时限），"
+                 "请重试；若反复出现，请把任务拆小（例如分段写入大文件）")
+BREAKER_CODE = "EMPTY_STREAM_BREAKER"
+
+
+def _ghost_retry_min_left() -> float:
+    """NOTION_GHOST_RETRY_MIN_LEFT (s, default 150): budget left needed to retry a ghost run
+    on another account inside the same request (a ghost needs minutes to show)."""
+    try:
+        return float(os.getenv("NOTION_GHOST_RETRY_MIN_LEFT", "150") or 150)
+    except ValueError:
+        return 150.0
+
+
+def _ghost_bookkeeping(meta, result) -> None:
+    """Tool-mode request finished: an empty answer becomes error EMPTY_STREAM (request_log
+    error_code=empty_stream, never a silent empty 200) and counts toward the conversation's
+    ghost breaker (app.ghost_guard); a real answer resets it."""
+    from app import ghost_guard as _gg
+    keys = (meta or {}).get("_conv_keys") or []
+    try:
+        if result.get("calls") or (result.get("text") or "").strip():
+            _gg.record_ok(keys)
+            return
+        if (meta or {}).get("_cancelled") or result.get("error"):
+            return  # client gone / truncation: not a ghost
+        kind = (meta or {}).get("_ghost_seen") or (meta or {}).get("_ghost") or "empty"
+        result["error"] = EMPTY_CODE
+        result["ghost"] = kind
+        n = _gg.record_empty(keys)
+        _note_truncation(meta, error_code="empty_stream", error_message=f"{kind}; consecutive={n}")
+        logger.warning("Empty answer returned as error", extra={"request_info": {
+            "event": "notion_empty_answer", "kind": kind, "consecutive": n,
+            "breaker_s": round(_gg.blocked(keys)), "conv_keys": keys[:1]}})
+    except Exception:
+        logger.warning("ghost bookkeeping failed", exc_info=True)
+
+
+def _empty_exc(result=None) -> NotionUpstreamError:
+    # a plain empty answer may still fail over to another account (as before); a ghost run
+    # already used the request budget, so the client should get the error now
+    ghost = (result or {}).get("ghost") not in (None, "empty")
+    exc = NotionUpstreamError(EMPTY_MESSAGE, status_code=502, retriable=not ghost)
+    exc.code = EMPTY_CODE
+    return exc
+
+
+def _empty_error_event() -> str:
+    err = {"message": EMPTY_MESSAGE, "type": "upstream_error", "code": EMPTY_CODE, "status": 502}
+    return f"data: {json.dumps({'error': err}, ensure_ascii=False)}\n\n"
 
 
 class _ClientGone(Exception):
@@ -1377,8 +1701,10 @@ def _tool_mode_non_stream(gen, response_id, model, cancel=None):
     if result is None:
         raise _ClientGone()
     calls = result["calls"]
+    if result.get("error") == TRUNC_CODE:
+        raise _truncated_exc()
     if not calls and not result["text"].strip():
-        raise NotionUpstreamError("Notion upstream returned empty content.", retriable=True)
+        raise _empty_exc(result)
     msg: Dict[str, Any] = {"role": "assistant", "content": (result["text"] or None) if calls else result["text"]}
     if calls:
         msg["tool_calls"] = calls
@@ -1535,7 +1861,253 @@ def _chain_events(held, gen):
     yield from gen
 
 
-def _tool_mode_stream(gen, response_id, model, client_type=""):
+_PREFERRED_TOOL_NAMES = ("Bash", "Read", "Write", "Edit", "Glob", "Grep", "shell", "read_file", "write_file")
+
+
+def _live_end(start=None):
+    """Hard cap for polling an inference that is still running when the request budget
+    runs out (NOTION_LIVE_MAX seconds from request start, default 450; 0 = off)."""
+    try:
+        v = float(os.getenv("NOTION_LIVE_MAX", "450") or 0)
+    except ValueError:
+        v = 450.0
+    return ((start or time.time()) + v) if v > 0 else None
+
+
+def _full_resend_reminder(tool_reminder, tools_active, tools, messages, info=None):
+    """Full-history resend (fresh Notion thread) of a long tool conversation: add a short,
+    user-voice note naming a few of the client's tools (NOTION_RESEND_TOOL_REMINDER=on).
+    In a huge fresh context the model otherwise sometimes decides only Notion tools exist."""
+    if not tools_active or os.getenv("NOTION_RESEND_TOOL_REMINDER", "on").strip().lower() in ("0", "off", "false", "no"):
+        return tool_reminder
+    try:
+        min_tok = float(os.getenv("NOTION_RESEND_REMINDER_MIN_TOKENS", "60000") or 60000)
+        est = sum(len(str(m.get("content") or "")) + len(json.dumps(m.get("tool_calls") or "", ensure_ascii=False))
+                  for m in messages) / 3.0
+        if est < min_tok:
+            return tool_reminder
+        names = []
+        for t in tools or []:
+            fn = t.get("function") if isinstance(t, dict) and isinstance(t.get("function"), dict) else t
+            n = (fn or {}).get("name") if isinstance(fn, dict) else None
+            if n:
+                names.append(n)
+        pick = [n for n in _PREFERRED_TOOL_NAMES if n in names] or names
+        pick = pick[:6]
+        if not pick:
+            return tool_reminder
+        note = ("(We are continuing our earlier session in my developer tool, where you can run the operations "
+                "listed at the start, e.g. " + ", ".join(f"`{n}`" for n in pick) +
+                ". Keep using them through <tool_call> action blocks as before.)")
+        if isinstance(info, dict):  # logged by the caller only when the full transcript is sent
+            info.update(est_tokens=int(est), tools=pick)
+        return f"{tool_reminder}\n\n{note}" if tool_reminder else note
+    except Exception:
+        return tool_reminder
+
+
+def _req_arrival():
+    try:
+        from app.request_log import current_log as _cl
+        return float((_cl.get() or {}).get("ts") or 0) or None
+    except Exception:
+        return None
+
+
+def _heartbeat_secs() -> float:
+    """Tool-mode tick interval (keepalive + progress check), NOTION_HEARTBEAT_SECS, default 2."""
+    try:
+        return max(0.5, float(os.getenv("NOTION_HEARTBEAT_SECS", "2") or 2))
+    except ValueError:
+        return 2.0
+
+
+def _early_stream_on() -> bool:
+    return os.getenv("NOTION_EARLY_STREAM", "on").strip().lower() not in ("0", "off", "false", "no")
+
+
+def _early_hold_secs() -> float:
+    try:
+        return max(0.0, float(os.getenv("NOTION_EARLY_STREAM_HOLD", "5") or 5))
+    except ValueError:
+        return 5.0
+
+
+def _early_stream_applies(request, req_body) -> bool:
+    """Non-tool streaming requests (tool mode has its own keepalive/progress), non-web."""
+    if not (req_body.stream and _early_stream_on()):
+        return False
+    if request.headers.get("X-Client-Type", "").lower() == "web":
+        return False
+    has_tools = bool(req_body.tools or req_body.functions) and req_body.tool_choice != "none" \
+        and os.getenv("ENABLE_TOOL_EMULATION", "0").strip().lower() in ("1", "true", "yes", "on")
+    return not has_tools
+
+
+async def _early_stream_wrap(request, req_body, make_coro):
+    """NOTION_EARLY_STREAM (default on): the standard (non-tool) path returns its
+    StreamingResponse only after Notion's first item, which arrives when the whole reply
+    is done (thinking scrub / persona guard buffer it), so clients saw no bytes for the
+    whole generation. Run the unchanged handler as a task; if it has not answered within
+    NOTION_EARLY_STREAM_HOLD s (default 5; fast errors keep their real HTTP status), start
+    the SSE stream ourselves: role frame, data keepalive every NOTION_HEARTBEAT_SECS,
+    thinking progress after NOTION_THINKING_PROGRESS_SECS, then the handler's own stream
+    (content, persona guard, retries/failover, usage all untouched). A late handler error
+    becomes an OpenAI-style in-stream error event + [DONE]."""
+    if not _early_stream_applies(request, req_body):
+        return await make_coro()
+    rid = f"chatcmpl-{uuid.uuid4().hex}"
+    try:
+        request.state.n2a_response_id = rid
+    except Exception:
+        pass
+    t_req = _req_arrival()
+    task = asyncio.ensure_future(make_coro())
+    try:
+        done, _ = await asyncio.wait({task}, timeout=_early_hold_secs())
+    except BaseException:
+        task.cancel()
+        raise
+    if done:
+        return task.result()
+    logger.info("Stream: early start, keepalive until first content", extra={"request_info": {
+        "event": "early_stream", "model": req_body.model, "hold_s": _early_hold_secs()}})
+    return StreamingResponse(
+        _early_stream_gen(request, task, rid, req_body.model, t_req),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
+
+
+async def _early_drain(task) -> None:
+    """Client gone before the handler's stream was consumed: let the handler finish (as it
+    did before), then close its stream so the upstream / thread bookkeeping is released."""
+    try:
+        res = await task
+    except BaseException:
+        return
+    it = getattr(res, "body_iterator", None)
+    if it is None:
+        return
+    try:
+        # start it (an unstarted async generator's aclose() skips its cleanup), then close:
+        # _guarded_stream's finally marks the request cancelled and closes the Notion stream
+        await it.__anext__()
+    except BaseException:
+        pass
+    aclose = getattr(it, "aclose", None)
+    if aclose is not None:
+        try:
+            await aclose()
+        except BaseException:
+            pass
+
+
+def _late_error_event(status: int, err: dict) -> str:
+    e = {"message": err.get("message") or "Upstream request failed, please retry.",
+         "type": err.get("type") or "upstream_error", "code": err.get("code") or "UPSTREAM_ERROR",
+         "status": int(err.get("status") or status or 502)}
+    return f"data: {json.dumps({'error': e}, ensure_ascii=False)}\n\n"
+
+
+async def _early_stream_gen(request, task, rid, model, t_req=None):
+    hb = _heartbeat_secs()
+    live = os.getenv("NOTION_STREAM_THINKING", "on").strip().lower() not in ("0", "off", "false", "no")
+    try:
+        prog_s = float(os.getenv("NOTION_THINKING_PROGRESS_SECS", "15") or 0)
+    except ValueError:
+        prog_s = 15.0
+    prog_fmt = os.getenv("NOTION_THINKING_PROGRESS_TEXT", "") or "(still working… {s}s)\n"
+    t_start = t_req if (t_req and t_req <= time.time()) else time.time()
+    last_shown = t_start
+    handed = False  # the handler's own stream is being consumed here
+    inner = None
+    try:
+        yield _build_stream_chunk(rid, model, role="assistant", content="")
+        while not task.done():
+            await asyncio.wait({task}, timeout=hb)
+            if task.done():
+                break
+            if await _client_disconnected(request):
+                _request_log_annotate(error_code="CLIENT_DISCONNECTED")
+                logger.info("Stream: client disconnected during early keepalive",
+                            extra={"request_info": {"event": "early_stream_client_gone"}})
+                return
+            now = time.time()
+            if live and prog_s > 0 and now - last_shown >= prog_s:
+                last_shown = now
+                try:
+                    ptxt = prog_fmt.format(s=int(now - t_start))
+                except Exception:
+                    ptxt = "(still working… %ds)\n" % int(now - t_start)
+                yield _build_stream_chunk(rid, model, thinking=ptxt)
+            else:
+                yield ("data: " + json.dumps({"id": rid, "object": "chat.completion.chunk", "created": int(time.time()),
+                                              "model": model, "choices": [{"index": 0, "delta": {"content": ""},
+                                                                           "finish_reason": None}]},
+                                             ensure_ascii=False) + "\n\n")
+        handed = True
+        try:
+            res = task.result()
+        except HTTPException as exc:
+            det = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
+            _request_log_annotate(error_code=str(det.get("code") or exc.status_code), error_message=str(det.get("message") or "")[:300])
+            yield _late_error_event(exc.status_code, {"type": "invalid_request_error", **det})
+            yield "data: [DONE]\n\n"
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Early stream: handler failed", exc_info=True,
+                         extra={"request_info": {"event": "early_stream_handler_failed"}})
+            _request_log_annotate(error_code="INTERNAL_ERROR", error_message=str(exc)[:300])
+            yield _late_error_event(500, {"type": "internal_error", "code": "INTERNAL_ERROR",
+                                          "message": "Internal error, please retry."})
+            yield "data: [DONE]\n\n"
+            return
+        if isinstance(res, StreamingResponse):
+            inner = res.body_iterator
+            async for chunk in inner:
+                yield chunk
+            inner = None
+            return
+        status = int(getattr(res, "status_code", 200) or 200)
+        body = None
+        if isinstance(res, Response):
+            try:
+                body = json.loads(res.body)
+            except Exception:
+                body = None
+        elif hasattr(res, "model_dump"):
+            body = res.model_dump()
+        elif isinstance(res, dict):
+            body = res
+        if status >= 400 or not isinstance(body, dict) or "choices" not in body:
+            err = (body or {}).get("error") if isinstance(body, dict) else None
+            err = err if isinstance(err, dict) else {}
+            _request_log_annotate(error_code=str(err.get("code") or status), error_message=str(err.get("message") or "")[:300])
+            logger.info("Early stream: late upstream error sent in-stream", extra={"request_info": {
+                "event": "early_stream_late_error", "status": status, "code": err.get("code")}})
+            yield _late_error_event(status if status >= 400 else 502, err)
+            yield "data: [DONE]\n\n"
+            return
+        # a non-stream completion for a stream request (not expected): replay it as chunks
+        ch = (body.get("choices") or [{}])[0]
+        msg = ch.get("message") or {}
+        if msg.get("reasoning_content"):
+            yield _build_stream_chunk(rid, model, thinking=msg["reasoning_content"])
+        if msg.get("content"):
+            yield _build_stream_chunk(rid, model, content=msg["content"])
+        yield _build_stream_chunk(rid, model, finish_reason=ch.get("finish_reason") or "stop")
+        yield "data: [DONE]\n\n"
+    finally:
+        if not handed:
+            asyncio.ensure_future(_early_drain(task))
+        elif inner is not None:
+            aclose = getattr(inner, "aclose", None)
+            if aclose is not None:
+                asyncio.ensure_future(aclose())
+
+
+def _tool_mode_stream(gen, response_id, model, client_type="", t_req=None):
     """Tool mode streams after the (possibly retried) attempt completes, so a refused
     attempt is never shown; SSE comments keep the connection alive meanwhile."""
     result = None
@@ -1546,12 +2118,35 @@ def _tool_mode_stream(gen, response_id, model, client_type=""):
                                  "model": model, "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": None}]},
                                 ensure_ascii=False) + "\n\n"
     yield _build_stream_chunk(response_id, model, role="assistant", content="")
+    live = client_type != "web" and os.getenv("NOTION_STREAM_THINKING", "on").strip().lower() not in ("0", "off", "false", "no")
+    try:
+        prog_s = float(os.getenv("NOTION_THINKING_PROGRESS_SECS", "15") or 0)
+    except ValueError:
+        prog_s = 15.0
+    prog_fmt = os.getenv("NOTION_THINKING_PROGRESS_TEXT", "") or "(still working… {s}s)\n"
+    t_start = t_req if (t_req and t_req <= time.time()) else time.time()  # from request arrival
+    last_shown = t_start
+    streamed_real = ""
     try:
         for ev in gen:
             if isinstance(ev, tuple):
                 result = ev[1]
+            elif isinstance(ev, dict) and "_think" in ev:
+                if live and ev["_think"]:
+                    streamed_real += ev["_think"]
+                    last_shown = time.time()
+                    yield _build_stream_chunk(response_id, model, role="", thinking=ev["_think"])
             else:
-                yield _ka
+                now = time.time()
+                if live and prog_s > 0 and now - last_shown >= prog_s:
+                    last_shown = now
+                    try:
+                        ptxt = prog_fmt.format(s=int(now - t_start))
+                    except Exception:
+                        ptxt = "(still working… %ds)\n" % int(now - t_start)
+                    yield _build_stream_chunk(response_id, model, role="", thinking=ptxt)
+                else:
+                    yield _ka
     except Exception as exc:
         if _is_client_disconnect_error(exc):
             return
@@ -1572,13 +2167,24 @@ def _tool_mode_stream(gen, response_id, model, client_type=""):
     if result is None:  # cancelled (client gone)
         return
     if not result["calls"] and not (result["text"] or "").strip():
-        err = {"message": "Notion upstream returned empty content, please retry.", "type": "upstream_error",
-               "code": "EMPTY_CONTENT", "status": 502}
-        yield f"data: {json.dumps({'error': err}, ensure_ascii=False)}\n\n"
+        yield _empty_error_event()
         yield "data: [DONE]\n\n"
         return
-    if result["thinking"] and client_type != "web":
-        yield _build_stream_chunk(response_id, model, role="assistant", thinking=result["thinking"])
+    if result.get("error") == TRUNC_CODE:
+        # every attempt stopped inside a <tool_call> block: keep any text before the tag,
+        # then an error event (never finish_reason=stop with partial markup as the answer)
+        if (result["text"] or "").strip():
+            yield _build_stream_chunk(response_id, model, role="", content=result["text"])
+        yield _truncated_error_event()
+        yield "data: [DONE]\n\n"
+        return
+    _final_think = result["thinking"] or ""
+    if streamed_real and _final_think.startswith(streamed_real):
+        _final_think = _final_think[len(streamed_real):]  # already streamed live
+    elif streamed_real and streamed_real.endswith(_final_think):
+        _final_think = ""
+    if _final_think and client_type != "web":
+        yield _build_stream_chunk(response_id, model, role="assistant", thinking=_final_think)
         started = True
     if result["text"]:
         yield _build_stream_chunk(response_id, model, role="" if started else "assistant", content=result["text"])
@@ -1656,6 +2262,14 @@ def _create_tool_stream_generator(
     if tail:
         yield _build_stream_chunk(response_id, model_name, role="" if started else "assistant", content=tail)
         started = True
+    if not calls and getattr(splitter, "truncated", False):
+        # stream cut inside a <tool_call> block: an error, not a finished answer
+        _note_truncation(None, nothing_parsed=1)
+        logger.warning("Tool stream ended inside a tool call block", extra={"request_info": {
+            "event": "tool_stream_truncated", "chars": len(raw)}})
+        yield _truncated_error_event()
+        yield "data: [DONE]\n\n"
+        return
     if calls:
         yield from _tool_call_chunks(response_id, model_name, calls, role_needed=not started)
     elif not started:
@@ -1765,7 +2379,7 @@ async def _handle_lite_request(
     for attempt in range(1, max_retries + 1):
         client = None
         try:
-            client = await _rtp(pool.get_client)
+            client = await _rtp(_pool_get, pool, model=req_body.model)
 
             # 构建 Lite transcript（无历史记忆）
             transcript = _apply_reasoning_effort(build_lite_transcript(user_prompt, req_body.model), req_body)
@@ -1960,7 +2574,12 @@ def _tr_reply_from_response(resp) -> dict | None:
         return None
 
 
-def _other_account_free(pool, client) -> bool:
+def _other_account_free(pool, client, model=None) -> bool:
+    if hasattr(pool, "other_free"):
+        try:
+            return pool.other_free(client, model)
+        except TypeError:
+            pass
     from app.account_pool import is_exhausted as _is_exhausted
     now = time.time()
     try:
@@ -1969,6 +2588,23 @@ def _other_account_free(pool, client) -> bool:
                        for c, cd in zip(pool.clients, pool.cooldown_until))
     except Exception:
         return False
+
+
+def _get_by_key(pool, key, model=None):
+    try:
+        return pool.get_client_by_key(key, model=model)
+    except TypeError:
+        return pool.get_client_by_key(key)
+
+
+def _pool_get(pool, *args, model=None):
+    """pool.get_client with the request model (model-aware routing) when supported."""
+    if model:
+        try:
+            return pool.get_client(*args, model=model)
+        except TypeError:
+            pass
+    return pool.get_client(*args)
 
 
 async def _handle_standard_request(
@@ -1996,7 +2632,7 @@ async def _handle_standard_request(
             detail=f"Unsupported model '{req_body.model}'. Available models: {', '.join(available_models)}",
         )
 
-    response_id = f"chatcmpl-{uuid.uuid4().hex}"
+    response_id = getattr(request.state, "n2a_response_id", None) or f"chatcmpl-{uuid.uuid4().hex}"
     max_retries = max(3, len(pool.clients))
 
     # Emulated OpenAI function calling (Notion has no client-defined tools)
@@ -2017,12 +2653,15 @@ async def _handle_standard_request(
     _non_sys = [m for m in (req_body.messages or []) if m.role not in ("system", "developer")]
     last_role = _non_sys[-1].role if _non_sys else ""
     if last_role in ("tool", "function"):
-        from app.tool_emulation import TOOL_RESULT_REMINDER
-        tool_reminder = TOOL_RESULT_REMINDER
+        from app.tool_emulation import TOOL_RESULT_REMINDER, TOOL_RESULT_REMINDER_TERSE, terse_enabled
+        tool_reminder = TOOL_RESULT_REMINDER_TERSE if terse_enabled() else TOOL_RESULT_REMINDER
 
     from app import thread_reuse as _tr
     from app.request_log import annotate as _rl_annotate
     messages_all = [msg.dict() for msg in req_body.messages]
+    _sugg = _suggestion_mode_reply(messages_all, req_body, response_id)
+    if _sugg is not None:
+        return _sugg
     reuse_on = _tr.enabled()
     tr_ident, tr_ident_src = _tr.identity(request.headers, req_body.user) if reuse_on else ("", [])
     tr_ns = _tr.namespace(req_body.model, tool_prompt, tr_ident) if reuse_on else ""
@@ -2117,6 +2756,40 @@ async def _handle_standard_request(
     except Exception as _exc:
         logger.warning(f"effort telemetry failed: {_exc}")
 
+    try:
+        from app import ghost_guard as _gg
+        _gg_left = _gg.blocked(conv_keys)
+    except Exception:
+        _gg_left = 0
+    if _gg_left > 0:
+        # this conversation's last runs all came back empty (thinking to Notion's output
+        # cap): fail fast for the cooldown instead of burning another account for ~5 min
+        logger.warning("Ghost breaker open: failing fast", extra={"request_info": {
+            "event": "notion_ghost_breaker", "left_s": round(_gg_left), "conv_keys": conv_keys[:1]}})
+        _rl_annotate(error_code="empty_stream_breaker", error_message=f"cooldown {round(_gg_left)}s")
+        _bexc = NotionUpstreamError(
+            f"该对话最近连续多次上游无输出（模型思考耗尽 Notion 单次输出上限），已暂停约 {int(_gg_left) + 1} 秒以免继续消耗额度；"
+            "请把任务拆小（例如分段写入大文件）后重试", status_code=502, retriable=False)
+        _bexc.code = "EMPTY_STREAM_BREAKER"
+        return _upstream_error_response(_bexc)
+
+    # resend dedupe (app.resend_dedupe): an identical request still running for a while is
+    # an abandoned copy the caller re-sent; stop it (interrupt + hedges) and serve this one
+    _dd_holder = None
+    try:
+        from app import resend_dedupe as _dd
+        _dd_fp = _dd.fingerprint(tr_ident or _tr.identity(request.headers, req_body.user)[0],
+                                 req_body.model, tool_prompt, messages_all)
+        if _dd_fp:
+            # off the event loop: superseding interrupts the old run (a Notion API call)
+            _dd_holder, _dd_victims = await _rtp(_dd.begin, _dd_fp, _rl_cur.get(), (conv_keys or [""])[0], _abort_upstream)
+            _rec_now = _rl_cur.get()
+            if isinstance(_rec_now, dict) and _dd_holder is not None:
+                _rec_now["_on_finish"] = (lambda h=_dd_holder: _dd.release(h))
+    except Exception as _exc:
+        logger.warning(f"resend dedupe failed: {_exc}")
+        _dd_holder = None
+
     def _finish_transcript(t):
         t = _apply_reasoning_effort(t, req_body)
         if tools_active and os.getenv("TOOL_MODE_NOTION_WEB", "0") != "1":
@@ -2135,6 +2808,11 @@ async def _handle_standard_request(
     last_exc: NotionUpstreamError | None = None
     tried_accounts: set = set()
     for attempt in range(1, max_retries + 1):
+        if _dd_holder is not None and _dd_holder.get("superseded"):
+            _sexc = NotionUpstreamError("This request was superseded by an identical newer request.",
+                                        status_code=409, retriable=False)
+            _sexc.code = "SUPERSEDED_DUPLICATE"
+            return _upstream_error_response(_sexc)
         if attempt > 1 and req_deadline and time.time() > req_deadline - 60:
             logger.info("Standard mode: request budget exhausted, not retrying", extra={"request_info": {
                 "event": "standard_budget_exhausted", "attempt": attempt, "budget_s": _budget}})
@@ -2142,28 +2820,51 @@ async def _handle_standard_request(
                 return _upstream_error_response(last_exc)
             break
         client = None
-        tr_meta: dict = {"_deadline": req_deadline, "_conv_keys": conv_keys, "_rl": _rl_cur.get()}
+        tr_meta: dict = {"_deadline": req_deadline, "_conv_keys": conv_keys, "_rl": _rl_cur.get(),
+                         "_live_end": _live_end(req_deadline and req_deadline - _budget),
+                         "_budget_end": req_deadline}
+        if _dd_holder is not None:
+            from app import resend_dedupe as _dd
+            _dd.attach(_dd_holder, tr_meta)
         reuse_tid = None
         tr_started = True  # until the continued request is dispatched
         try:
             if reuse_plan is not None:
-                client = pool.get_client_by_key(reuse_plan["entry"]["account"])
+                client = _get_by_key(pool, reuse_plan["entry"]["account"], req_body.model)
                 if client is None and hasattr(pool, "key_cooldown_left"):
                     # the thread's account is only briefly cooling: wait for it rather than
                     # lose the conversation cache on a fresh thread elsewhere
                     left = pool.key_cooldown_left(reuse_plan["entry"]["account"])
                     if 0 < left <= float(os.getenv("THREAD_REUSE_WAIT_COOLDOWN", "8") or 0):
                         await asyncio.sleep(left + 0.05)
-                        client = pool.get_client_by_key(reuse_plan["entry"]["account"])
+                        client = _get_by_key(pool, reuse_plan["entry"]["account"], req_body.model)
                         if client is not None:
                             reuse_plan["waited"] = round(left, 1)
+                if client is not None and hasattr(pool, "acquire_sticky"):
+                    # POOL_LOAD_AWARE: the thread's account may run up to ACCOUNT_HARD_INFLIGHT;
+                    # above that wait THREAD_REUSE_WAIT_INFLIGHT s, then a new thread elsewhere
+                    if not await _rtp(pool.acquire_sticky, client):
+                        client = None
+                        reuse_status, reuse_plan = "account_busy", None
                 if client is None:
-                    reuse_status, reuse_plan = "account_unavailable", None
+                    if reuse_plan is not None:
+                        _lg_key = reuse_plan["entry"]["account"]
+                        reuse_status = "account_unavailable"
+                        try:
+                            from app.account_pool import is_exhausted as _lg_exh, limit_guard as _lg_on
+                            _lg_c = next((c for c in pool.clients if getattr(c, "account_key", "") == _lg_key), None)
+                            if _lg_on() and _lg_c is not None and _lg_exh(_lg_c):
+                                reuse_status = "account_limited"  # break stickiness: full transcript elsewhere
+                                logger.info("Limit guard: sticky thread's account over limit", extra={"request_info": {
+                                    "event": "limit_guard_block", "path": "sticky_reuse", "account": _lg_key}})
+                        except Exception:
+                            pass
+                        reuse_plan = None
                 else:
                     reuse_tid = reuse_plan["entry"]["thread_id"]
             if client is None:
                 # may sleep for a cooling account: never on the event loop
-                client = await _rtp(pool.get_client, True, tried_accounts)
+                client = await _rtp(_pool_get, pool, True, tried_accounts, model=req_body.model)
             tried_accounts.add(getattr(client, "account_key", ""))
 
             # 构建 Standard transcript（完整上下文）
@@ -2176,9 +2877,10 @@ async def _handle_standard_request(
             # Tool mode: Notion's built-in web is disabled (client brings its own tools; the
             # urlSafety confirm continuation 502s) and URLs get a zero-width space after the
             # scheme so Notion doesn't auto-"view" them (context_urls); see _finish_transcript.
+            _rr_info: dict = {}
             transcript = _finish_transcript(build_standard_transcript(
                 messages, req_body.model, account,
-                tool_prompt=tool_prompt, tool_reminder=tool_reminder,
+                tool_prompt=tool_prompt, tool_reminder=_full_resend_reminder(tool_reminder, tools_active, tools, messages, _rr_info),
             ))
             full_transcript = transcript
             tr_meta["_hedge_transcript"] = full_transcript  # fresh-thread transcript for an effort hedge
@@ -2199,6 +2901,9 @@ async def _handle_standard_request(
                 "new_msgs": len((reuse_plan or {}).get("new") or []), "account": client.account_key,
                 "sys_delta_lines": (reuse_plan or {}).get("sys_delta_lines"), "tools_changed": (reuse_plan or {}).get("tools_changed"),
                 "waited_s": (reuse_plan or {}).get("waited"), "identity_sources": tr_ident_src, **({"diag": tr_diag} if tr_diag and not reuse_tid else {})}})
+            if _rr_info and not reuse_tid:
+                logger.info("Resend tool reminder added", extra={"request_info": {
+                    "event": "resend_tool_reminder", **_rr_info}})
             if reuse_on:
                 _rl_annotate(thread_reuse=(reuse_status if reuse_tid else f"miss:{reuse_status}"))
             if reuse_tid:
@@ -2224,7 +2929,12 @@ async def _handle_standard_request(
                         pt = int(raw.get("inputTokens", 0) or 0) + int(raw.get("cachedTokensCreated", 0) or 0)
                 except Exception:
                     pt = None
-                _tr.STORE.put(tr_ns, _msgs, reply, _meta.get("thread_id"), _meta.get("account"),
+                _tid, _acc = _reuse_target(_meta)
+                if _meta.get("_reuse_thread_id"):
+                    logger.info("Sticky reuse follows the winning hedge thread", extra={"request_info": {
+                        "event": "reuse_hedge_winner", "thread_id": _tid, "account": _acc,
+                        "original_thread_id": _meta.get("thread_id")}})
+                _tr.STORE.put(tr_ns, _msgs, reply, _tid, _acc,
                               tool_prompt=tool_prompt, prompt_tokens=pt)
 
             if tools_active:
@@ -2246,9 +2956,15 @@ async def _handle_standard_request(
                     held, early_exc = await _rtp(_prepull_tool_events, tool_gen)
                     if early_exc is not None:
                         raise early_exc  # handled below like the non-stream path (failover / JSON error)
+                    if held and isinstance(held[-1], tuple) and isinstance(held[-1][1], dict) \
+                            and held[-1][1].get("error") == TRUNC_CODE:
+                        raise _truncated_exc()  # known before the first byte: a real HTTP 502
+                    if held and isinstance(held[-1], tuple) and isinstance(held[-1][1], dict) \
+                            and held[-1][1].get("error") == EMPTY_CODE:
+                        raise _empty_exc(held[-1][1])  # known before the first byte: a real HTTP 502
                     return StreamingResponse(
                         _guarded_stream(request, _tr_capture_stream(_tool_mode_stream(_chain_events(held, tool_gen), response_id, req_body.model,
-                                          request.headers.get("X-Client-Type", "").lower()), _tr_store), tr_meta),
+                                          request.headers.get("X-Client-Type", "").lower(), t_req=_req_arrival()), _tr_store), tr_meta),
                         media_type="text/event-stream",
                         headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
                     )
@@ -2461,7 +3177,7 @@ async def _handle_standard_request(
             if client is not None and _is_exhausted(client) and attempt < max_retries:
                 continue  # out of credits: fail over to the next account now
             if (exc.status_code in (429, 503) and client is not None and attempt < max_retries
-                    and _other_account_free(pool, client)):
+                    and _other_account_free(pool, client, req_body.model)):
                 # this account is fair-use limited even after backoff: rest it and fail over
                 pool.mark_failed(client, cooldown_seconds=int(os.getenv("NOTION_RATELIMIT_FAILOVER_COOLDOWN", "45") or 45))
                 reuse_plan = None
@@ -2535,11 +3251,28 @@ async def create_chat_completion(
     if not req_body.messages:
         return _build_error_response(400, code="invalid_value", error_type="invalid_request_error",
                                      message="'messages' must contain at least one message.")
+    _allowed = getattr(request.state, "allowed_models", None)
     if not is_supported_model(req_body.model):
+        _avail = list_available_models()
+        if _allowed is not None:  # a scoped key only learns about its own models
+            from app.api_keys import model_allowed as _ma
+            _avail = [m for m in _avail if _ma(_allowed, m)]
         return JSONResponse(status_code=404, content={"error": {
             "message": f"The model '{req_body.requested_model or req_body.model}' does not exist. Available models: "
-                       + ", ".join(list_available_models()),
+                       + ", ".join(_avail),
             "type": "invalid_request_error", "param": "model", "code": "model_not_found"}})
+    if _allowed is not None:  # scoped API key (None = all models)
+        from app.api_keys import model_allowed
+        if not (model_allowed(_allowed, req_body.model) and model_allowed(_allowed, req_body.requested_model or req_body.model)):
+            try:
+                from app.request_log import annotate as _rla
+                _rla(error_code="model_not_allowed")
+            except Exception:
+                pass
+            return JSONResponse(status_code=403, content={"error": {
+                "message": f"Model '{req_body.requested_model or req_body.model}' is not allowed for this API key. "
+                           f"Allowed models: {', '.join(_allowed) or '(none)'}",
+                "type": "invalid_request_error", "param": "model", "code": "model_not_allowed"}})
     if req_body.n not in (None, 1):
         return _build_error_response(400, code="unsupported_value", error_type="invalid_request_error",
                                      message="Only n=1 is supported.")
@@ -2593,7 +3326,7 @@ async def _create_chat_completion_impl(
 
     # Standard 模式：完整上下文，支持 thinking 和搜索
     if is_standard_mode():
-        return await _handle_standard_request(request, req_body, response)
+        return await _early_stream_wrap(request, req_body, lambda: _handle_standard_request(request, req_body, response))
 
     # Heavy 模式：完整会话管理
     pool = request.app.state.account_pool
@@ -2677,7 +3410,7 @@ async def _create_chat_completion_impl(
     for attempt in range(1, max_retries + 1):
         client = None
         try:
-            client = await _rtp(pool.get_client)
+            client = await _rtp(_pool_get, pool, model=req_body.model)
             transcript_payload = manager.get_transcript_payload(
                 notion_client=client,
                 conversation_id=conversation_id,

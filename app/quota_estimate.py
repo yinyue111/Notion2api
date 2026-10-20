@@ -6,9 +6,11 @@ Inputs per account:
 Token counts are priced at the official Claude Opus API list rates (env-overridable):
   input $5/M, cache read $0.50/M, output $25/M (uncached input = prompt - cached).
 
-Capacity ($ for 100% of a window) = logged $ inside the window / (window % / 100), only
-when our log covers the whole window and the % is big enough to be meaningful; otherwise the
-pool median of the measured accounts, otherwise NOTION_MONTHLY_USD_EST / NOTION_ROLLING_USD_EST.
+Per-account capacity ($ for 100% of a window) = logged $ inside the window / (window % / 100)
+when spend > 0 and used% >= MIN_PCT. Coverage of the full window is recorded as source quality
+(account vs account_partial) but does NOT fall back to the pool median — accounts without
+enough data show null (「不足」 in the UI). Pool median is only a summary card over accounts
+that have their own estimate. Pool totals sum estimable accounts only.
 Everything here is an *estimate*: Notion meters credits, not tokens.
 """
 from __future__ import annotations
@@ -51,10 +53,19 @@ def period_start(reset_at: int) -> int:
     return int(d.replace(year=y, month=m, day=day).timestamp())
 
 
-def _capacity(cost: float, pct: Optional[float], covered: bool) -> Optional[float]:
-    if not covered or pct is None or pct < MIN_PCT or cost <= 0:
+def _capacity(cost: float, pct: Optional[float]) -> Optional[float]:
+    """Invert capacity from this account's own spend and used%. No pool fallback."""
+    if pct is None or pct < MIN_PCT or cost <= 0:
         return None
     return cost / (pct / 100.0)
+
+
+def _covered_month(ps: Optional[int], first: Optional[float]) -> bool:
+    return bool(ps and first and first <= ps + 3600)
+
+
+def _covered_rolling(ws: Optional[int], first: Optional[float]) -> bool:
+    return bool(ws and first and first <= ws)
 
 
 def estimate(accounts: list[dict], cost_since, first_log_ts, now: Optional[float] = None) -> dict:
@@ -68,32 +79,54 @@ def estimate(accounts: list[dict], cost_since, first_log_ts, now: Optional[float
         row = {"id": a.get("id"), "label": label, "status": rl.get("status"), "checked_at": rl.get("checked_at"),
                "rolling_pct": rl.get("rolling_pct"), "monthly_pct": rl.get("monthly_pct"),
                "rolling_reset_at": rl.get("rolling_reset_at"), "monthly_reset_at": rl.get("monthly_reset_at"),
-               "limited_by": rl.get("limited_by")}
+               "limited_by": rl.get("limited_by"), "resume_at": rl.get("resume_at")}
         mr = rl.get("monthly_reset_at")
         ps = period_start(int(mr)) if mr else None
         row["period_start"] = ps
         row["month_cost"] = round(cost_since(label, ps), 4) if ps else None
-        row["_m_cap"] = _capacity(row["month_cost"] or 0, row["monthly_pct"], bool(ps and first and first <= ps + 3600))
+        m_cov = _covered_month(ps, first)
+        row["_m_cap"] = _capacity(row["month_cost"] or 0, row["monthly_pct"])
+        row["_m_cov"] = m_cov
         rr = rl.get("rolling_reset_at")
         ws = (int(rr) - ROLLING_SECONDS) if rr else None
         row["rolling_cost"] = round(cost_since(label, ws), 4) if ws else None
-        row["_r_cap"] = _capacity(row["rolling_cost"] or 0, row["rolling_pct"], bool(ws and first and first <= ws))
+        r_cov = _covered_rolling(ws, first)
+        row["_r_cap"] = _capacity(row["rolling_cost"] or 0, row["rolling_pct"])
+        row["_r_cov"] = r_cov
         rows.append(row)
 
-    def pool_value(key: str, env: str):
-        vals = [r[key] for r in rows if r[key]]
-        if vals:
-            return statistics.median(vals), "measured"
-        v = _envf(env, 0.0)
-        return (v, "configured") if v > 0 else (None, "unknown")
+    m_vals = [r["_m_cap"] for r in rows if r["_m_cap"]]
+    r_vals = [r["_r_cap"] for r in rows if r["_r_cap"]]
+    m_med = statistics.median(m_vals) if m_vals else None
+    r_med = statistics.median(r_vals) if r_vals else None
+    # Basis for the median card only (not applied to rows).
+    if m_vals:
+        m_src = "measured"
+    else:
+        v = _envf("NOTION_MONTHLY_USD_EST", 0.0)
+        m_med = v if v > 0 else None
+        m_src = "configured" if m_med else "unknown"
+    if r_vals:
+        r_src = "measured"
+    else:
+        v = _envf("NOTION_ROLLING_USD_EST", 0.0)
+        r_med = v if v > 0 else None
+        r_src = "configured" if r_med else "unknown"
 
-    m_med, m_src = pool_value("_m_cap", "NOTION_MONTHLY_USD_EST")
-    r_med, r_src = pool_value("_r_cap", "NOTION_ROLLING_USD_EST")
     tot = {"month_capacity": 0.0, "month_remaining": 0.0, "rolling_remaining": 0.0, "known": 0}
     for r in rows:
-        mcap, msrc = (r["_m_cap"], "account") if r["_m_cap"] else (m_med, "pool_" + m_src if m_med else "unknown")
-        rcap, rsrc = (r["_r_cap"], "account") if r["_r_cap"] else (r_med, "pool_" + r_src if r_med else "unknown")
-        r.pop("_m_cap"); r.pop("_r_cap")
+        mcap = r.pop("_m_cap")
+        m_cov = r.pop("_m_cov")
+        rcap = r.pop("_r_cap")
+        r_cov = r.pop("_r_cov")
+        if mcap:
+            msrc = "account" if m_cov else "account_partial"
+        else:
+            msrc = "insufficient"
+        if rcap:
+            rsrc = "account" if r_cov else "account_partial"
+        else:
+            rsrc = "insufficient"
         r["month_capacity_usd"] = round(mcap, 2) if mcap else None
         r["month_capacity_source"] = msrc
         r["rolling_capacity_usd"] = round(rcap, 2) if rcap else None

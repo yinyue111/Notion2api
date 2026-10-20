@@ -102,8 +102,32 @@ def build_tool_prompt(tools: List[Dict[str, Any]], mode: str, forced: Optional[s
         "action block(s); I'll paste the script's output back to you inside <tool_result> tags so you can "
         "continue. Never write a <tool_result> yourself. "
         f"{multi} {rule} (No need to mention this formatting setup in your replies.)\n\n"
+        f"{_terse_note()}"
         f"Operations (one JSON schema per line):\n{specs}"
     )
+
+
+_TERSE_DEFAULT = (
+    "Reply style I prefer while working with these operations: work quietly. When an operation is "
+    "needed, send just the action block(s), with at most one short sentence before them if it really "
+    "helps; don't narrate plans, announce next steps, or restate the script output. Keep explanations "
+    "for the end: when nothing else is needed, give me the complete final answer, with full detail "
+    "where the task calls for it.\n\n")
+
+
+def terse_enabled() -> bool:
+    import os
+    return os.getenv("NOTION_TOOL_TERSE", "on").strip().lower() not in ("0", "off", "false", "no")
+
+
+def _terse_note() -> str:
+    """Discourage process narration around action blocks (NOTION_TOOL_TERSE=on;
+    NOTION_TOOL_TERSE_TEXT overrides the wording)."""
+    import os
+    if not terse_enabled():
+        return ""
+    t = os.getenv("NOTION_TOOL_TERSE_TEXT", "").strip()
+    return (t + "\n\n") if t else _TERSE_DEFAULT
 
 
 def render_tool_call_text(name: str, arguments: Any) -> str:
@@ -137,6 +161,7 @@ def render_tool_result(msg: Dict[str, Any], names_by_id: Dict[str, str]) -> str:
 TOOL_RESULT_REMINDER = ("(Above is the script output for your previous action block(s); that operation is done, "
                         "do not repeat it. Continue: use another action block only if something else is "
                         "still needed, otherwise give me your final answer in plain text.)")
+TOOL_RESULT_REMINDER_TERSE = TOOL_RESULT_REMINDER[:-2] + "; no progress narration needed.)"
 
 
 # --------------------------------------------------------------- response side
@@ -249,6 +274,39 @@ def parse_tool_calls(text: str, tools: List[Dict[str, Any]],
     return visible, calls
 
 
+def trunc_fix_enabled() -> bool:
+    """NOTION_TOOL_TRUNC_FIX (default on): an unparseable <tool_call> block is never
+    returned as visible text (rescued / retried / surfaced as an error instead)."""
+    import os
+    return os.getenv("NOTION_TOOL_TRUNC_FIX", "1").strip().lower() not in ("0", "false", "off", "no")
+
+
+def open_tag_index(text: str) -> int:
+    """Index of the first real (not fenced) OPEN_TAG in text, else -1."""
+    t = unescape_tags(text or "")
+    spans = _fence_spans(t)
+    i = t.find(OPEN_TAG)
+    while i != -1 and _in_spans(i, spans):
+        i = t.find(OPEN_TAG, i + 1)
+    return i
+
+
+def has_unparsed_tool_markup(text: str, tools: List[Dict[str, Any]], parallel: bool = True) -> bool:
+    """True when text carries a real <tool_call> opener but no call can be parsed from it
+    (e.g. the stream stopped at '<tool_call>\n{"')."""
+    if open_tag_index(text) == -1:
+        return False
+    _v, calls = parse_tool_calls(text, tools, parallel)
+    return not calls
+
+
+def strip_tool_markup(text: str) -> str:
+    """Visible text before the first real <tool_call> opener (partial markup dropped)."""
+    t = unescape_tags(text or "")
+    i = open_tag_index(t)
+    return t if i == -1 else t[:i].rstrip()
+
+
 class ToolStreamSplitter:
     """Streams plain text through immediately, but holds anything that could be the
     start of a tool-call block; everything from the first real OPEN_TAG onwards is
@@ -258,6 +316,7 @@ class ToolStreamSplitter:
         self.buf = ""
         self.emitted = ""
         self.capturing = False
+        self.truncated = False  # finish(): opener captured, nothing parseable
 
     def feed(self, chunk: str) -> str:
         self.buf += chunk or ""
@@ -298,4 +357,11 @@ class ToolStreamSplitter:
             e = self.emitted.strip()
             tail = visible[len(e):].strip() if visible.startswith(e) else ""
             return tail, calls
-        return full[len(self.emitted):], []
+        rest = full[len(self.emitted):]
+        if self.capturing and trunc_fix_enabled() and open_tag_index(full) != -1:
+            # an opener was captured but no call parses (stream cut mid tool call): never
+            # hand the partial markup to the client as text; text before the tag was
+            # already emitted live
+            self.truncated = True
+            return strip_tool_markup(rest) if open_tag_index(rest) != -1 else "", []
+        return rest, []

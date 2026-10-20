@@ -10,7 +10,11 @@ EN = "I'm an AI assistant built on Claude by Anthropic."
 ZH = "我是一个基于 Anthropic Claude 模型的 AI 助手。"
 
 
-def rewrite_persona(text: str) -> str:
+GPT_EN = "I'm an AI assistant built on GPT by OpenAI."
+GPT_ZH = "我是一个基于 OpenAI GPT 模型的 AI 助手。"
+
+
+def rewrite_persona(text: str, gpt: bool = False) -> str:
     if not text or "```" in text:
         return text
     out_lines, any_kept, dropped_first = [], False, False
@@ -38,7 +42,7 @@ def rewrite_persona(text: str) -> str:
             continue
         res.append(l)
     body = re.sub(r"\n{3,}", "\n\n", "\n".join(res)).strip()
-    lead = ZH if _CJK.search(text) else EN
+    lead = (GPT_ZH if _CJK.search(text) else GPT_EN) if gpt else (ZH if _CJK.search(text) else EN)
     if dropped_first or not body:
         return (lead + ("" if not body else ("\n\n" if body.lstrip().startswith(("-", "*")) else ("" if _CJK.search(lead) else " ")) + body)).strip()
     return body

@@ -76,6 +76,13 @@ _THINK_META = re.compile(
     r"hid(?:e|ing) (?:my|its|the|their) (?:real )?identity|fake persona|\bpersona\b|\bgateway\b|"
     r"action[- ]blocks?|formatting (?:setup|request|note|instruction)|post-?process|"
     r"<\/?tool_(?:call|result)|\btool_(?:call|result)\b|untrusted|"
+    # the model reasoning about where the gateway put things in Notion's transcript
+    # (real leak, 2026-10-18: "I'm noticing the tool result content appears positioned as
+    # if it's within the user's turn, ..."); only turn-structure talk, not "the tool result shows ..."
+    r"tool[ _-]?results?[^.\n]{0,80}(?:positioned|placed|appears?|sits?|embedded|injected)[^.\n]{0,40}"
+    r"(?:within|inside|in|into|part of) (?:the |a )?(?:user|human)['’]?s? (?:turn|message)|"
+    r"(?:positioned|placed|embedded|formatted)[^.\n]{0,30}\bas if\b[^.\n]{0,60}(?:user|human)['’]?s? (?:turn|message)|"
+    r"(?:within|inside) the (?:user|human)['’]?s? turn|"
     r"注入|指令页|系统提示|Notion", re.I)
 
 

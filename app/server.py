@@ -105,6 +105,28 @@ async def lifespan(app: FastAPI):
         cur["rateLimit"] = st
         _st.set_credits(aid, cur)
     app.state.account_pool.on_usage_status = _persist_usage
+
+    def _persist_caps(client, cap, _st=_st):
+        aid = getattr(client, "admin_id", None)
+        if _st is None or aid is None:
+            return
+        cur = next((a.get("credits") for a in _st.list_accounts() if a.get("id") == aid), None) or {}
+        cur = dict(cur) if isinstance(cur, dict) else {}
+        wsn = getattr(client, "workspace_name", "") or cur.get("workspace_name") or ""
+        cur["capabilities"] = cap
+        if wsn:
+            cur["workspace_name"] = wsn
+        _st.set_credits(aid, cur)
+    app.state.account_pool.on_capabilities = _persist_caps
+    if (os.getenv("USAGE_MONITOR", "1").strip().lower() not in ("0", "false", "off")
+            and os.getenv("USAGE_STARTUP_REFRESH", "on").strip().lower() not in ("0", "false", "off")):
+        try:
+            import asyncio as _aio
+            await _aio.wait_for(_aio.to_thread(_um.startup_refresh, app.state.account_pool),
+                                timeout=_um._f("USAGE_STARTUP_REFRESH_TIMEOUT", 15.0) + 5.0)
+        except Exception as _exc:  # never block or break startup
+            logger.warning("Usage startup refresh failed", extra={"request_info": {
+                "event": "usage_startup_refresh_error", "error": type(_exc).__name__}})
     _um.start(lambda: getattr(app.state, "account_pool", None))
     yield
     # 关闭时清理
@@ -254,10 +276,21 @@ async def api_key_auth(request: Request, call_next):
         auth_header = request.headers.get("Authorization", "")
         bearer = auth_header[7:].strip() if auth_header.startswith("Bearer ") else ""
         if bearer:
-            if API_KEY and not admin_sec.const_eq(bearer, API_KEY):
-                return _v1_unauthorized()
-            request.state.auth = "api_key"
-            _rl_annotate(auth="api_key")
+            from app import api_keys as _ak
+            if API_KEY and admin_sec.const_eq(bearer, API_KEY):
+                request.state.auth = "api_key"
+                _rl_annotate(auth="api_key")
+            else:
+                scoped = _ak.lookup(bearer)
+                if scoped is not None:
+                    request.state.auth = "key:" + str(scoped.get("name") or "scoped")
+                    request.state.allowed_models = _ak.allowed_for(scoped)  # None = all models
+                    _rl_annotate(auth=request.state.auth)
+                elif API_KEY:
+                    return _v1_unauthorized()
+                else:
+                    request.state.auth = "api_key"
+                    _rl_annotate(auth="api_key")
         elif API_KEY:
             sess = admin_sec.get_session(request)
             if not sess:
@@ -298,7 +331,15 @@ async def favicon():
 async def health_check():
     # async on purpose: a sync handler needs a free threadpool worker, so /health would
     # hang (and the container go unhealthy) exactly when Notion calls saturate the pool
-    return {"status": "ok"}
+    out = {"status": "ok"}
+    try:  # in-flight Notion streams / pick reservations (totals only, no account names)
+        pool = getattr(app.state, "account_pool", None)
+        if pool is not None:
+            st = pool.get_status_summary()
+            out.update(inflight=st.get("inflight", 0), reserved=st.get("reserved", 0))
+    except Exception:
+        pass
+    return out
 
 # 挂载静态前端到根目录
 frontend_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend")

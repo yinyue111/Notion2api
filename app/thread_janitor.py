@@ -19,6 +19,15 @@ from app.logger import logger
 
 _lock = threading.Lock()
 _started = False
+_fails: dict = {}  # thread_id -> consecutive failed deletions (this process)
+_DROP_STATUSES = (400, 404)
+
+
+def _max_fails() -> int:
+    try:
+        return max(1, int(os.getenv("NOTION_THREAD_CLEANUP_MAX_FAILS", "3") or 3))
+    except ValueError:
+        return 3
 
 
 def enabled() -> bool:
@@ -87,14 +96,30 @@ def run_once(pool, limit: int | None = None) -> dict:
             continue
         ok = False
         try:
+            cl._last_delete_status = None
+        except Exception:
+            pass
+        try:
             ok = bool(cl.delete_thread(tid))
         except Exception:
             ok = False
         if ok:
             out["archived"] += 1
+            _fails.pop(tid, None)
             _forget(tid)
         else:
             out["failed"] += 1
+            st = getattr(cl, "_last_delete_status", None)
+            n = _fails.get(tid, 0) + 1
+            _fails[tid] = n
+            if st in _DROP_STATUSES or n >= _max_fails():
+                # permanent (thread gone / not in this space) or keeps failing: stop retrying
+                _fails.pop(tid, None)
+                _forget(tid)
+                out["dropped"] = out.get("dropped", 0) + 1
+                logger.info("Notion thread cleanup: dropped record", extra={"request_info": {
+                    "event": "thread_cleanup_dropped", "thread_id": tid, "account": acc,
+                    "status": st, "fails": n, "why": ("status_%s" % st) if st in _DROP_STATUSES else "max_fails"}})
         time.sleep(float(os.getenv("NOTION_THREAD_CLEANUP_PACE", "1.5") or 1.5))
     if any(out.values()):
         logger.info("Notion thread cleanup", extra={"request_info": {"event": "thread_cleanup", **out}})

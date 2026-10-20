@@ -170,9 +170,19 @@ class LoginFlows:
         cands = candidates_from_spaces(spaces) if r2.status_code == 200 else []
         if not cands:
             raise LoginError("logged in, but no Notion workspace was found for this account", 400)
+        for c in cands:  # restricted (GPT-only) vs Claude-capable, shown in the picker
+            try:
+                from app import workspaces as _ws
+                r3, models = self._post(sess, "getAvailableModels", {"spaceId": c["space_id"]})
+                cap = _ws.parse_capabilities(models) if r3.status_code == 200 else None
+                c["capability"] = _ws.capability_label(cap)
+                if cap:
+                    c["_capabilities"] = cap
+            except Exception:
+                c["capability"] = "unknown"
         f["candidates"] = cands
-        return {"flow_id": flow_id, "candidates": [{k: c[k] for k in ("user_email", "user_name", "space_id",
-                                                                        "space_name", "plan")} for c in cands]}
+        return {"flow_id": flow_id, "candidates": [{k: c.get(k) for k in ("user_email", "user_name", "space_id",
+                                                                            "space_name", "plan", "capability")} for c in cands]}
 
     def take(self, flow_id: str, owner: str, space_id: Optional[str] = None) -> dict:
         """Pop the finished flow -> full account dict (with token_v2) for the store."""
@@ -187,7 +197,8 @@ class LoginFlows:
         self.cancel(flow_id, owner)
         c = dict(cands[0])
         c["token_v2"] = f["token"]
-        c.pop("space_name", None); c.pop("plan", None)
+        c["_space_name"] = c.pop("space_name", None) or ""
+        c.pop("plan", None); c.pop("capability", None)
         if not c.get("user_email"):
             c["user_email"] = f["email"]
         return c

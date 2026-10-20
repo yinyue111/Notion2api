@@ -55,6 +55,12 @@ def _finalize(rec: dict) -> dict:
                 pass
     else:
         rec["usage_reported"] = 0
+    fc = getattr(col, "first_content_ts", None) if col is not None else None
+    if fc and rec.get("ts"):
+        try:
+            rec["upstream_first_content_ms"] = max(0, int((fc - float(rec["ts"])) * 1000))
+        except (TypeError, ValueError):
+            pass
     if col is not None and getattr(col, "error", None) and not rec.get("error_code"):
         rec["error_code"] = "stream_error"
         rec["error_message"] = str(col.error)[:300]
@@ -64,6 +70,23 @@ def _finalize(rec: dict) -> dict:
     for b in ("has_tools", "long_gen_match", "silent_close", "would_downgrade"):
         if b in rec:
             rec[b] = 1 if rec[b] else 0
+    if not rec.get("usage_reported") and fc and (rec.get("status") or 0) < 400 \
+            and not rec.get("error_code"):
+        # H: a delivered reply that carried no Notion usage (sub2api bills it as estimated)
+        try:
+            from app.logger import logger as _lg
+            _lg.warning("Reply delivered without usage", extra={"request_info": {
+                "event": "usage_missing_on_reply", "model": rec.get("model"),
+                "account": rec.get("account"), "path": rec.get("path")}})
+        except Exception:
+            pass
+    if keys and rec.get("effort_final") in ("xhigh", "max") and not rec.get("silent_close") \
+            and (rec.get("status") or 0) < 400 and not rec.get("error_code"):
+        try:
+            from app import cap_memory
+            cap_memory.reset_faster(keys)  # answered at the requested effort without a hedge
+        except Exception:
+            pass
     if rec.get("cap_memory") == "probe" and keys and not rec.get("silent_close") \
             and (rec.get("status") or 0) < 400 and not rec.get("error_code"):
         try:
@@ -101,6 +124,12 @@ class RequestLogMiddleware:
                 return
             state["done"] = True
             rec["latency_ms"] = int((time.time() - t0) * 1000)
+            cb = rec.pop("_on_finish", None)
+            if callable(cb):
+                try:
+                    cb()  # e.g. resend_dedupe.release
+                except Exception:
+                    pass
             if state["err_buf"] and not rec.get("error_code"):
                 try:
                     err = json.loads(state["err_buf"].decode("utf-8", "ignore")).get("error") or {}

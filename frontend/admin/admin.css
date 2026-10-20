@@ -411,3 +411,50 @@ dialog .hint { margin: 0 0 16px; }
   .page-chat.active { margin: -18px -16px; }
   .cards { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
 }
+
+/* ── API keys ── */
+dialog.wide { width: 760px; }
+.key-row { display: flex; gap: 16px; align-items: flex-end; }
+.key-row > label { flex: 1; }
+.chk-inline { flex-direction: row; align-items: center; gap: 8px; color: var(--text); font-weight: 500; }
+.chk-inline.strong { font-weight: 650; margin: 0; }
+.chk-inline input { width: 16px; height: 16px; padding: 0; }
+.models-box { border: 1px solid var(--line); border-radius: var(--r-sm); padding: 12px; margin-bottom: 12px; }
+.models-head { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+.models-tools { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.models-tools input { width: 130px; padding: 5px 8px; }
+.models-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 4px 12px; max-height: 300px; overflow: auto; }
+.models-grid.disabled { opacity: .45; pointer-events: none; }
+.models-grid label { flex-direction: row; align-items: center; gap: 8px; margin: 0; padding: 4px 2px; color: var(--text); font-weight: 500; font-size: 13px; }
+.models-grid label input { width: 15px; height: 15px; padding: 0; }
+.models-grid .alias { color: var(--muted); font-size: 11.5px; }
+.secret-box { background: var(--bg); border: 1px dashed var(--line-strong); border-radius: var(--r-sm); padding: 12px; margin-bottom: 12px; word-break: break-all; }
+.secret-box code { font-size: 13px; user-select: all; }
+.key-models-cell { max-width: 360px; white-space: normal; }
+.key-models-cell .badge { margin: 1px 4px 1px 0; }
+code.kh { font-size: 12px; }
+
+/* ── Overview: range picker, value, price table (2026-10-18) ── */
+.range-bar { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; margin: 14px 0 16px; }
+.seg { display: inline-flex; border: 1px solid var(--line-strong); border-radius: 8px; overflow: hidden; background: var(--panel); }
+.seg button { border: 0; background: transparent; color: var(--text-2); padding: 6px 12px; font: inherit; font-size: 13px; cursor: pointer; border-right: 1px solid var(--line); }
+.seg button:last-child { border-right: 0; }
+.seg button:hover { background: var(--panel-2); }
+.seg button.on { background: var(--pri); color: var(--pri-t); }
+.range-custom { display: inline-flex; gap: 6px; align-items: center; }
+.range-custom input { height: 30px; padding: 2px 6px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--panel); color: var(--text); font: inherit; font-size: 13px; }
+.range-custom.on input { border-color: var(--pri); }
+.card.value .v { color: var(--pri); }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 10px; }
+.chip { font-size: 12px; padding: 3px 9px; border-radius: 999px; background: var(--bad-soft); color: var(--bad); border: 1px solid var(--bad-bd); }
+.bar.value { background: var(--ok); }
+.usd { font-variant-numeric: tabular-nums; font-weight: 600; }
+.prices-box { margin-top: 24px; border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; background: var(--panel); }
+.prices-box summary { cursor: pointer; font-weight: 600; }
+.code-area { width: 100%; box-sizing: border-box; font-family: var(--font-mono); font-size: 12px; line-height: 1.45; border: 1px solid var(--line-strong); border-radius: 8px; padding: 8px; background: var(--panel-2); color: var(--text); resize: vertical; }
+td .sub { display: block; color: var(--muted); font-size: 11px; line-height: 1.3; }
+
+/* ── API key reveal / copy ── */
+.key-cell { display: inline-flex; flex-wrap: wrap; gap: 6px; align-items: center; max-width: 420px; }
+.key-cell code.kh.shown { word-break: break-all; user-select: all; color: var(--text); }
+.key-cell .badge { flex-shrink: 0; }

@@ -173,7 +173,20 @@ class AdminStore:
             cfg[k] = r[k] or ""
         cfg["_admin_id"] = r["id"]
         cfg["_label"] = r["label"] or ""
+        try:  # last known workspace capability / name (refreshed live by usage_monitor)
+            cr = json.loads(r["credits_json"]) if r["credits_json"] else {}
+            if isinstance(cr, dict):
+                if isinstance(cr.get("capabilities"), dict):
+                    cfg["_capabilities"] = cr["capabilities"]
+                if cr.get("workspace_name"):
+                    cfg["_workspace_name"] = str(cr["workspace_name"])
+        except (ValueError, TypeError):
+            pass
         return cfg
+
+    def find_by_space(self, space_id: str) -> Optional[int]:
+        r = self._conn().execute("SELECT id FROM accounts WHERE space_id=? ORDER BY id LIMIT 1", (str(space_id),)).fetchone()
+        return r["id"] if r else None
 
     def find_account_id(self, space_id: str, user_id: str) -> Optional[int]:
         r = self._conn().execute("SELECT id FROM accounts WHERE space_id=? AND user_id=?",
@@ -248,7 +261,14 @@ class AdminStore:
                    ("silent_close_secs", "INTEGER"), ("hedge_winner", "TEXT"), ("hedge_effort", "TEXT"),
                    ("notion_output_tokens", "INTEGER"), ("cap_memory", "TEXT"), ("would_downgrade", "INTEGER"),
                    ("cache_write_tokens", "INTEGER"), ("uncached_input_tokens", "INTEGER"),
-                   ("prev_prompt_tokens", "INTEGER"), ("prompt_shrink", "INTEGER"))
+                   ("prev_prompt_tokens", "INTEGER"), ("prompt_shrink", "INTEGER"),
+                   ("upstream_first_content_ms", "INTEGER"), ("dead_retry", "TEXT"), ("live_extend", "INTEGER"),
+                   # tool-call truncation diagnostics (2026-10-18)
+                   ("content_chars", "INTEGER"), ("thinking_chars", "INTEGER"), ("scrubbed_segments", "INTEGER"),
+                   ("final_source", "TEXT"), ("final_len", "INTEGER"), ("nothing_parsed", "INTEGER"),
+                   ("trunc_retry", "INTEGER"), ("trunc_rescue", "TEXT"), ("short_reconcile", "TEXT"),
+                   # effort actually sent to Notion (after clamp + NOTION_EFFORT_FLOOR), 2026-10-20
+                   ("effort_sent", "TEXT"))
     _LOG_COLS = _LOG_COLS + tuple(c for c, _ in _EXTRA_COLS)
 
     def _writer(self) -> None:
@@ -286,11 +306,20 @@ class AdminStore:
         c.commit()
         return cur.rowcount
 
+    def auth_usage(self) -> dict:
+        """Per auth label ("api_key", "key:<name>", "admin_session"): requests / errors /
+        tokens / last use over the retained log (LOG_RETENTION_DAYS)."""
+        rows = self._conn().execute(
+            "SELECT auth, " + self._AGG + ", MAX(ts) last_ts FROM request_log WHERE auth IS NOT NULL GROUP BY auth").fetchall()
+        return {r["auth"]: dict(r) for r in rows}
+
     def list_requests(self, limit: int = 50, offset: int = 0, model: str = "", account: str = "",
-                      status: str = "") -> dict:
+                      status: str = "", auth: str = "") -> dict:
         where, args = ["1=1"], []
         if model:
             where.append("model=?"); args.append(model)
+        if auth:
+            where.append("auth=?"); args.append(auth)
         if account:
             where.append("account=?"); args.append(account)
         if status == "error":
@@ -313,6 +342,22 @@ class AdminStore:
         p = d.get("prompt_tokens") or 0
         d["cache_hit_rate"] = round((d.get("cached_tokens") or 0) / p, 4) if p else None
         return d
+
+    def usage_rows(self, start: float, end: float) -> list:
+        """Per-request rows for the overview range (metadata + token counts only)."""
+        return self._conn().execute(
+            "SELECT ts, model, account, auth, status, error_code, latency_ms, usage_reported, "
+            "prompt_tokens, cached_tokens, cache_write_tokens, uncached_input_tokens, completion_tokens "
+            "FROM request_log WHERE ts>=? AND ts<? ORDER BY ts", (start, end)).fetchall()
+
+    def errors_in_range(self, start: float, end: float, limit: int = 10) -> list:
+        return [dict(r) for r in self._conn().execute(
+            "SELECT id, ts, model, stream, status, latency_ms, account, auth, error_code, error_message FROM request_log WHERE ts>=? AND ts<? AND (status>=400 OR error_code IS NOT NULL) "
+            "ORDER BY ts DESC LIMIT ?", (start, end, int(limit))).fetchall()]
+
+    def first_log_ts(self) -> Optional[float]:
+        r = self._conn().execute("SELECT MIN(ts) FROM request_log").fetchone()
+        return r[0] if r else None
 
     def stats(self, days: int = 7, tz_offset_hours: int = 8) -> dict:
         since = time.time() - days * 86400

@@ -890,7 +890,287 @@ def _pending_url_confirmation(step: Any) -> dict[str, Any] | None:
     return {"type": "pending_confirmation", "step_id": step["id"], "tool": step.get("toolName")}
 
 
-def parse_stream(response: requests.Response) -> Generator[dict[str, Any], None, None]:
+# ---- Shadow of Notion's patch state (2026-10-18) ----
+# Notion's patch stream is RFC-6902-like JSON patch over {"s": [steps]} (ops from the web
+# client: a=add r=remove p=replace m=move(f) c=copy(f) t=test x=append(string)
+# s=replaceSuffix(r=removeCount, v=list); patch-start / patch-sync carry the whole "s").
+# The segment registry below only counts value-block *adds*, so after a remove the
+# (step, value-index) → role table points at the wrong block. When Notion retries an
+# inference inside the same step (attempt 1 = a native tool_use the harness rejected; it
+# is kept in previousAttemptValues and the step's value is rebuilt), the new text block
+# reuses index 1, which the registry still had as the old tool_use, so every later
+# append was emitted as *thinking* and only the first chunk ("The music",
+# '<tool_call>\n{"') reached the answer. The shadow applies every op exactly, so the role
+# of a block is read from the real block type, and at stream end the turn's visible
+# inference text is reconciled with what was emitted. NOTION_STREAM_SHADOW=0 disables.
+def _shadow_resync_on() -> bool:
+    """NOTION_STREAM_SHADOW_RESYNC (default on): after a failed op, a later full snapshot
+    (patch-start / patch-sync) makes the shadow state usable again."""
+    return os.getenv("NOTION_STREAM_SHADOW_RESYNC", "on").strip().lower() not in ("0", "off", "false", "no")
+
+
+def _shadow_on() -> bool:
+    return os.getenv("NOTION_STREAM_SHADOW", "1").strip().lower() not in ("0", "false", "off", "no")
+
+
+def _shadow_lenient_remove() -> bool:
+    """NOTION_SHADOW_LENIENT_REMOVE (default on): a remove op on a missing object key is a no-op."""
+    import os as _os
+    return _os.getenv("NOTION_SHADOW_LENIENT_REMOVE", "on").strip().lower() not in ("0", "off", "false", "no")
+
+
+def _ptr_tokens(path: str) -> list[str] | None:
+    if path == "":
+        return []
+    if not isinstance(path, str) or not path.startswith("/"):
+        return None
+    return [t.replace("~1", "/").replace("~0", "~") for t in path.split("/")[1:]]
+
+
+_ITEM_ROLE = {"text": SEG_CONTENT, "thinking": SEG_THINKING, "redacted_thinking": SEG_THINKING,
+              "tool_use": SEG_TOOL}
+
+
+class _ShadowState:
+    def __init__(self) -> None:
+        self.doc: dict[str, Any] = {"s": []}
+        self.errors = 0
+        self.ops = 0
+        self.unknown_ops: set[str] = set()
+        self.touched: set[int] = set()
+        self.retried_steps: set[int] = set()
+        self.total_errors = 0  # every failed op of the stream (errors resets on a resync)
+        self.resyncs = 0
+        self.first_error: dict[str, Any] | None = None
+
+    def reset(self, steps: Any) -> None:
+        import copy
+        self.doc = {"s": copy.deepcopy(steps) if isinstance(steps, list) else []}
+        if self.errors and _shadow_resync_on():
+            # a full snapshot (patch-start / patch-sync) is authoritative again: resync
+            # instead of staying disabled for the rest of the stream
+            self.errors = 0
+            self.resyncs += 1
+
+    def _note_error(self, op: str, path: str, exc: Exception) -> None:
+        """Diagnostics for the first failing op (NOTION_STREAM_SHADOW): structure only,
+        never patch values (user content)."""
+        self.errors += 1
+        self.total_errors += 1
+        if self.first_error is not None:
+            return
+        step_id = step_type = None
+        tokens: list[str] = []
+        try:
+            tokens = _ptr_tokens(path) or []
+            steps = self.doc.get("s") or []
+            if len(tokens) >= 2 and tokens[0] == "s" and steps:
+                idx = len(steps) - 1 if tokens[1] == "-" else (int(tokens[1]) if tokens[1].isdigit() else None)
+                if idx is not None and 0 <= idx < len(steps) and isinstance(steps[idx], dict):
+                    step_id, step_type = steps[idx].get("id"), steps[idx].get("type")
+        except Exception:
+            pass
+        self.first_error = {"op": op[:8], "path": str(path or "")[:120], "error": type(exc).__name__,
+                            "detail": str(exc)[:60], "op_index": self.ops, "steps": len(self.doc.get("s") or []),
+                            "step_index": tokens[1][:8] if len(tokens) >= 2 else None,
+                            "step_id": str(step_id)[:40] if step_id else None,
+                            "step_type": str(step_type)[:40] if step_type else None}
+        try:
+            logger.warning("Stream shadow op failed", extra={"request_info": {
+                "event": "stream_shadow_op_failed", **self.first_error}})
+        except Exception:
+            pass
+
+    def _walk(self, tokens: list[str]):
+        cur: Any = self.doc
+        for t in tokens[:-1]:
+            if isinstance(cur, list):
+                cur = cur[len(cur) - 1 if t == "-" else int(t)]
+            elif isinstance(cur, dict):
+                cur = cur[t]
+            else:
+                raise KeyError(t)
+        return cur, tokens[-1]
+
+    def _get(self, tokens: list[str]):
+        parent, key = self._walk(tokens)
+        if isinstance(parent, list):
+            return parent[len(parent) - 1 if key == "-" else int(key)]
+        return parent[key]
+
+    def _add(self, tokens: list[str], value: Any) -> None:
+        parent, key = self._walk(tokens)
+        if isinstance(parent, list):
+            if key == "-":
+                parent.append(value)
+            else:
+                i = int(key)
+                if i < 0 or i > len(parent):
+                    raise IndexError(i)
+                parent.insert(i, value)
+        elif isinstance(parent, dict):
+            parent[key] = value
+        else:
+            raise KeyError(key)
+
+    def _remove(self, tokens: list[str]) -> Any:
+        parent, key = self._walk(tokens)
+        if isinstance(parent, list):
+            return parent.pop(int(key))
+        if isinstance(parent, dict) and key not in parent and _shadow_lenient_remove():
+            # Notion re-running a step (previousAttemptValues) removes fields such as
+            # value/0/finishedAt that the stream never added: idempotent, not a desync
+            self.lenient_removes = getattr(self, "lenient_removes", 0) + 1
+            return None
+        return parent.pop(key)
+
+    def apply(self, patch: dict[str, Any], path: str) -> bool:
+        import copy
+        op = str(patch.get("o", "") or "")
+        tokens = _ptr_tokens(path)
+        self.ops += 1
+        try:
+            if tokens is None or not tokens or tokens[0] != "s":
+                raise KeyError(path)
+            v = patch.get("v")
+            if op == "a":
+                self._add(tokens, copy.deepcopy(v))
+            elif op == "r":
+                self._remove(tokens)
+            elif op == "p":
+                parent, key = self._walk(tokens)
+                if isinstance(parent, list):
+                    parent[int(key)] = copy.deepcopy(v)
+                else:
+                    if key not in parent:
+                        raise KeyError(key)
+                    parent[key] = copy.deepcopy(v)
+            elif op in ("m", "c"):
+                src = _ptr_tokens(str(patch.get("f", "")))
+                if not src:
+                    raise KeyError("from")
+                val = self._remove(src) if op == "m" else copy.deepcopy(self._get(src))
+                self._add(tokens, val)
+            elif op == "t":
+                pass
+            elif op == "x":
+                parent, key = self._walk(tokens)
+                if not isinstance(v, str):
+                    raise TypeError("append")
+                if isinstance(parent, list):
+                    i = int(key)
+                    if not isinstance(parent[i], str):
+                        raise TypeError("append")
+                    parent[i] = parent[i] + v
+                else:
+                    if not isinstance(parent.get(key), str):
+                        raise TypeError("append")
+                    parent[key] = parent[key] + v
+            elif op == "s":
+                target = self._get(tokens)
+                n = patch.get("r")
+                if not isinstance(target, list) or not isinstance(v, list) or not isinstance(n, int) or n < 0 or n > len(target):
+                    raise TypeError("replaceSuffix")
+                del target[len(target) - n:]
+                target.extend(copy.deepcopy(v))
+            else:
+                self.unknown_ops.add(op)
+                raise KeyError(op)
+        except Exception as exc:
+            self._note_error(op, path, exc)
+            return False
+        steps = self.doc.get("s") or []
+        if len(tokens) >= 2:
+            idx = len(steps) - 1 if tokens[1] == "-" else (int(tokens[1]) if tokens[1].isdigit() else None)
+            if idx is not None:
+                self.touched.add(idx)
+                if len(tokens) >= 3 and tokens[2] == "previousAttemptValues":
+                    self.retried_steps.add(idx)
+        return True
+
+    @property
+    def usable(self) -> bool:
+        return self.errors == 0
+
+    def is_inference(self, path: str) -> bool:
+        tokens = _ptr_tokens(path)
+        try:
+            steps = self.doc["s"]
+            step = steps[len(steps) - 1 if tokens[1] == "-" else int(tokens[1])]
+            return isinstance(step, dict) and step.get("type") == "agent-inference"
+        except Exception:
+            return False
+
+    def role_for(self, path: str) -> str | None:
+        """Role of the value block a /s/N/value/K... path addresses, from its real type."""
+        if not self.usable:
+            return None
+        tokens = _ptr_tokens(path)
+        if not tokens or len(tokens) < 4 or tokens[0] != "s" or tokens[2] != "value":
+            return None
+        try:
+            steps = self.doc["s"]
+            step = steps[len(steps) - 1 if tokens[1] == "-" else int(tokens[1])]
+            if not isinstance(step, dict) or step.get("type") != "agent-inference":
+                return None
+            vals = step.get("value")
+            if not isinstance(vals, list) or not vals:
+                return None
+            item = vals[len(vals) - 1 if tokens[3] == "-" else int(tokens[3])]
+        except Exception:
+            return None
+        if not isinstance(item, dict):
+            return None
+        return _ITEM_ROLE.get(str(item.get("type") or "").lower())
+
+    def turn_text(self) -> str:
+        """Visible answer text of this response's agent-inference steps (what Notion's UI
+        renders: earlier attempts' text blocks, tool_use excluded, then the final value)."""
+        steps = self.doc.get("s") or []
+        out: list[str] = []
+        for i, st in enumerate(steps):
+            if not isinstance(st, dict) or st.get("type") != "agent-inference":
+                continue
+            parts: list[str] = []
+            for att in st.get("previousAttemptValues") or []:
+                if isinstance(att, list):
+                    parts.append(_extract_text_from_value_items(att))
+            parts.append(_extract_text_from_value_items(st.get("value")))
+            txt = "".join(parts)
+            if txt:
+                il, ip = [False], [False]
+                txt = _clean_notion_markup(_strip_primary_attr_fragments(_strip_lang_tags(txt, il), ip))
+                out.append(txt)
+        return "".join(out)
+
+
+_WS_RE = re.compile(r"\s+")
+_VALUE_PLACE_RE = re.compile(r"^/s/\d+/value(/\d+)?$")
+
+
+def _missing_tail(emitted: str, full: str) -> str:
+    """Part of `full` after `emitted`, comparing with whitespace ignored ("" if `emitted`
+    is not a prefix of `full`)."""
+    ne = _WS_RE.sub("", emitted or "")
+    nf = _WS_RE.sub("", full or "")
+    if len(nf) <= len(ne) or not nf.startswith(ne):
+        return ""
+    if not ne:
+        return full
+    seen = 0
+    for pos, ch in enumerate(full):
+        if not ch.isspace():
+            seen += 1
+            if seen == len(ne):
+                tail = full[pos + 1:]
+                k = len(emitted) - len(emitted.rstrip())  # whitespace already sent
+                while k and tail[:1].isspace():
+                    tail, k = tail[1:], k - 1
+                return tail
+    return ""
+
+
+def parse_stream(response: requests.Response, tap=None, meta: dict | None = None) -> Generator[dict[str, Any], None, None]:
     """
     解析 Notion NDJSON 流，输出三种结构化事件：
       - {"type": "content",  "text": "..."}   正文
@@ -924,6 +1204,9 @@ def parse_stream(response: requests.Response) -> Generator[dict[str, Any], None,
     usage_tracker = UsageTracker()
     reported_models: list[str] = []  # Notion-reported model per agent-inference step
     step_kinds: list[str] = []  # non-inference steps (Notion built-in tools), names only
+    shadow = _ShadowState() if _shadow_on() else None
+    emitted_content: list[str] = []
+    role_fixes = 0
 
     _dump = None
     if os.getenv("NOTION_RAW_DUMP_DIR"):  # debug only (test containers)
@@ -931,6 +1214,11 @@ def parse_stream(response: requests.Response) -> Generator[dict[str, Any], None,
     for line in response.iter_lines(decode_unicode=True):
         if _dump is not None and line:
             _dump.write((line if isinstance(line, str) else line.decode()) + "\n"); _dump.flush()
+        if tap is not None and line:
+            try:
+                tap(line)
+            except Exception:
+                pass
         if not line:
             continue
         if isinstance(line, bytes):
@@ -958,8 +1246,12 @@ def parse_stream(response: requests.Response) -> Generator[dict[str, Any], None,
             yield notion_error
             continue
 
-        if data_type == "patch-start":
+        if data_type in ("patch-start", "patch-sync"):
             steps = (data.get("data") or {}).get("s") if isinstance(data.get("data"), dict) else None
+            if shadow is not None and isinstance(steps, list):
+                shadow.reset(steps)
+            if data_type == "patch-sync":
+                continue
             if isinstance(steps, list):
                 for st in steps:
                     err = _step_error(st)
@@ -997,6 +1289,8 @@ def parse_stream(response: requests.Response) -> Generator[dict[str, Any], None,
             patch_v = patch.get("v")
             patch_path = _normalize_path(patch)
             patch_seg = _extract_segment_index(patch_path)
+            if shadow is not None:
+                shadow.apply(patch, patch_path)
 
             if isinstance(patch_v, str) and re.match(r"^/?s/\d+/model$", patch_path or ""):
                 reported_models.append(patch_v)
@@ -1161,6 +1455,14 @@ def parse_stream(response: requests.Response) -> Generator[dict[str, Any], None,
                         },
                     )
 
+            # The shadow knows the real type of the addressed value block (the registry
+            # loses track after removes / an in-step retry): trust it when it has one.
+            if shadow is not None and patch_op in ("a", "x", "p"):
+                sh_role = shadow.role_for(patch_path)
+                if sh_role is not None and sh_role != seg_owner:
+                    role_fixes += 1
+                    seg_owner = sh_role
+
             # ========== 搜索元数据（与段落角色无关，始终提取） ==========
             is_search_patch = _looks_like_search_patch(patch)
             if is_search_patch:
@@ -1181,6 +1483,19 @@ def parse_stream(response: requests.Response) -> Generator[dict[str, Any], None,
 
             # Notion tool I/O (e.g. create-pages input, view results) is never answer text.
             if _TOOL_IO_PATH_RE.search(patch_path or ""):
+                continue
+
+            # Whole value blocks placed by replace / replaceSuffix (an in-step retry rebuilding
+            # the step's value): the text extractor below only reads add / append ops, so
+            # emit whatever answer text the state now has beyond what was already sent.
+            if shadow is not None and shadow.usable and patch_op in ("p", "s") and \
+                    _VALUE_PLACE_RE.match(patch_path or "") and shadow.is_inference(patch_path):
+                from app.lang_sanitizer import clean_lang as _cl
+                tail = _missing_tail(_cl("".join(emitted_content)), _cl(shadow.turn_text()))
+                if tail.strip():
+                    role_fixes += 1
+                    emitted_content.append(tail)
+                    yield {"type": "content", "text": tail}
                 continue
 
             content = _extract_text_from_patch(patch)
@@ -1216,7 +1531,34 @@ def parse_stream(response: requests.Response) -> Generator[dict[str, Any], None,
             if seg_owner in (SEG_THINKING, SEG_TOOL):
                 yield {"type": "thinking", "text": cleaned}
             else:
+                emitted_content.append(cleaned)
                 yield {"type": "content", "text": cleaned}
+
+    if shadow is not None:
+        try:
+            emitted = "".join(emitted_content)
+            full = shadow.turn_text() if shadow.usable else ""
+            from app.lang_sanitizer import clean_lang as _cl
+            tail = _missing_tail(_cl(emitted), _cl(full)) if full else ""
+            if tail.strip():
+                yield {"type": "content", "text": tail}
+            if tail.strip() or role_fixes or shadow.retried_steps or not shadow.usable or shadow.total_errors:
+                logger.info("Stream state reconciled", extra={"request_info": {
+                    "event": "stream_shadow", "role_fixes": role_fixes, "appended": len(tail),
+                    "emitted": len(emitted), "state_text": len(full), "retried_steps": len(shadow.retried_steps),
+                    "errors": shadow.total_errors, "resyncs": shadow.resyncs, "usable": shadow.usable,
+                    "unknown_ops": sorted(shadow.unknown_ops)[:5]}})
+            if meta is not None:
+                # degraded stream: the client's short-reply reconcile must re-read the record
+                meta["_stream_shadow"] = {"errors": shadow.total_errors, "retried_steps": len(shadow.retried_steps),
+                                          "usable": shadow.usable, "disabled": False}
+        except Exception:
+            logger.warning("Stream shadow reconcile failed", exc_info=True,
+                           extra={"request_info": {"event": "stream_shadow_error"}})
+            if meta is not None:
+                meta["_stream_shadow"] = {"errors": 1, "retried_steps": 0, "usable": False, "disabled": False}
+    elif meta is not None:
+        meta["_stream_shadow"] = {"errors": 0, "retried_steps": 0, "usable": False, "disabled": True}
 
     if reported_models:
         logger.info("Notion-reported step models", extra={"request_info": {

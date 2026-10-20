@@ -36,10 +36,22 @@ class ChatMessage(BaseModel):
                 elif isinstance(part, dict) and part.get("type") in ("image_url", "input_image", "image"):
                     # images can't be forwarded; say so instead of silently dropping them
                     # (otherwise the model guesses at an image it never saw)
-                    texts.append("\n[An image was attached here, but it could not be passed to you: "
-                                 "you cannot see it. If the request depends on it, say so.]\n")
+                    from app import image_input as _ii
+                    texts.append(_ii.part_to_text(part))
                 elif isinstance(part, dict) and part.get("type") in ("input_text", "output_text"):
                     texts.append(part.get("text") or "")
+                elif isinstance(part, dict) and part.get("type") == "tool_result":
+                    # Anthropic-style tool_result block (text + image content) nested in a message
+                    from app import image_input as _ii
+                    _c = part.get("content")
+                    if isinstance(_c, list):
+                        inner = "".join((p.get("text") or "") if isinstance(p, dict) and p.get("type") in ("text", "input_text", "output_text")
+                                        else _ii.part_to_text(p) if isinstance(p, dict) and p.get("type") in ("image_url", "input_image", "image")
+                                        else (p if isinstance(p, str) else "") for p in _c)
+                    else:
+                        inner = "" if _c is None else str(_c)
+                    tid = part.get("tool_use_id") or ""
+                    texts.append(f"\n<tool_result tool_call_id=\"{tid}\">\n{inner}\n</tool_result>\n" if tid else inner)
             return "".join(texts)
         return str(v)
 

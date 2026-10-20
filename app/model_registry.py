@@ -287,6 +287,35 @@ def clamp_effort(notion_model: str, effort: Optional[str]) -> Optional[str]:
     return min(supported, key=lambda e: (abs(EFFORT_ORDER.index(e) - idx), -EFFORT_ORDER.index(e)))
 
 
+def _effort_floors() -> dict[str, str]:
+    """NOTION_EFFORT_FLOOR="<notion_model_or_public_name>:<effort>,..." -> {notion_model: effort}.
+    Unset/empty = no floors. Invalid entries are ignored."""
+    raw = os.getenv("NOTION_EFFORT_FLOOR", "").strip()
+    out: dict[str, str] = {}
+    if not raw:
+        return out
+    for item in raw.split(","):
+        name, sep, eff = item.strip().rpartition(":")
+        name, eff = name.strip(), normalize_effort(eff)
+        if not sep or not name or not eff:
+            continue
+        out[get_notion_model(name) if name in MODEL_MAP else name] = eff
+    return out
+
+
+def apply_effort_floor(notion_model: str, effort: Optional[str]) -> Optional[str]:
+    """Raise `effort` (already clamped) to the NOTION_EFFORT_FLOOR level for this Notion
+    model; never lowers a higher effort. The floor itself is clamped to what the model
+    supports. No floor configured -> effort unchanged."""
+    floor = _effort_floors().get(notion_model)
+    if not floor:
+        return effort
+    floor = clamp_effort(notion_model, floor) or floor
+    if not effort or EFFORT_ORDER.index(effort) < EFFORT_ORDER.index(floor):
+        return floor
+    return effort
+
+
 def effort_from_budget(budget) -> Optional[str]:
     try:
         b = int(budget)

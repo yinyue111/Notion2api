@@ -7,6 +7,7 @@ ignored (always reported as false), hosted/built-in tools are ignored.
 """
 from __future__ import annotations
 
+import os
 import json
 import time
 import uuid
@@ -40,7 +41,10 @@ def _content_text(content: Any) -> str:
                 out.append(p)
             elif isinstance(p, dict) and p.get("type") in _TEXT_PART_TYPES:
                 out.append(p.get("text") or "")
-            elif isinstance(p, dict) and p.get("type") in ("input_image", "input_file"):
+            elif isinstance(p, dict) and p.get("type") == "input_image":
+                from app import image_input as _ii
+                out.append(_ii.part_to_text(p))
+            elif isinstance(p, dict) and p.get("type") == "input_file":
                 out.append("[attachment omitted: not supported by this endpoint]")
         return "".join(out)
     return str(content)
@@ -122,7 +126,11 @@ def _usage(chat_usage: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     u = chat_usage or {}
     pt, ct = int(u.get("prompt_tokens") or 0), int(u.get("completion_tokens") or 0)
     cached = int(((u.get("prompt_tokens_details") or {}).get("cached_tokens")) or 0)
-    return {"input_tokens": pt, "input_tokens_details": {"cached_tokens": cached},
+    itd = {"cached_tokens": cached}
+    cw = int(((u.get("prompt_tokens_details") or {}).get("cache_write_tokens")) or 0)
+    if cw:
+        itd["cache_write_tokens"] = cw
+    return {"input_tokens": pt, "input_tokens_details": itd,
             "output_tokens": ct, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": pt + ct}
 
 
@@ -245,7 +253,7 @@ async def create_response(request: Request, response: Response):
     if not isinstance(result, StreamingResponse):
         return result  # error before streaming started
     return StreamingResponse(_translate_stream(result, rid, body, custom, created), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+                             headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"})
 
 
 async def _translate_stream(chat_stream: StreamingResponse, rid: str, body: Dict[str, Any], custom: set, created: int):
@@ -264,6 +272,9 @@ async def _translate_stream(chat_stream: StreamingResponse, rid: str, body: Dict
     finished = False
     truncated = False
 
+    # tiny first write: a compressing proxy (Caddy `encode gzip`) decides on the first bytes;
+    # a short flushed write keeps the SSE stream uncompressed and therefore unbuffered
+    yield ": ok\n\n"
     yield ev("response.created", response=_response_obj(rid, body, [], None, "in_progress", created))
     yield ev("response.in_progress", response=_response_obj(rid, body, [], None, "in_progress", created))
 
@@ -297,6 +308,24 @@ async def _translate_stream(chat_stream: StreamingResponse, rid: str, body: Dict
         res.append(ev("response.output_item.done", output_index=st["index"], item=item))
         return res
 
+    _ka_on = os.getenv("NOTION_RESPONSES_KEEPALIVE", "on").strip().lower() not in ("0", "off", "false", "no")
+    _reasoning_on = os.getenv("NOTION_RESPONSES_REASONING", "on").strip().lower() not in ("0", "off", "false", "no")
+    rs = None
+    rs_closed = False
+
+    def close_rs():
+        nonlocal rs_closed
+        if rs is None or rs_closed:
+            return []
+        rs_closed = True
+        item = {"type": "reasoning", "id": rs["id"], "summary": [{"type": "summary_text", "text": rs["text"]}]}
+        output[rs["index"]] = item
+        return [ev("response.reasoning_summary_text.done", item_id=rs["id"], output_index=rs["index"],
+                   summary_index=0, text=rs["text"]),
+                ev("response.reasoning_summary_part.done", item_id=rs["id"], output_index=rs["index"],
+                   summary_index=0, part={"type": "summary_text", "text": rs["text"]}),
+                ev("response.output_item.done", output_index=rs["index"], item=item)]
+
     buf = ""
     try:
         async for raw in chat_stream.body_iterator:
@@ -314,7 +343,26 @@ async def _translate_stream(chat_stream: StreamingResponse, rid: str, body: Dict
                     usage = _usage(chunk["usage"])
                 for ch in chunk.get("choices") or []:
                     delta = ch.get("delta") or {}
+                    if delta == {"content": ""} and not ch.get("finish_reason") and _ka_on:
+                        # chat-stream data keepalive (no content yet): relays drop ": comment"
+                        # lines, so keep the Responses stream alive with a real event
+                        yield ev("response.in_progress", response=_response_obj(rid, body, [], None, "in_progress", created))
+                        continue
+                    rtext = delta.get("reasoning_content")
+                    if rtext and _reasoning_on and msg is None and not calls and not rs_closed:
+                        if rs is None:
+                            rs = {"id": "rs_" + uuid.uuid4().hex[:24], "text": "", "index": len(output)}
+                            output.append({"type": "reasoning", "id": rs["id"], "summary": []})
+                            yield ev("response.output_item.added", output_index=rs["index"], item=output[rs["index"]])
+                            yield ev("response.reasoning_summary_part.added", item_id=rs["id"], output_index=rs["index"],
+                                     summary_index=0, part={"type": "summary_text", "text": ""})
+                        rs["text"] += rtext
+                        yield ev("response.reasoning_summary_text.delta", item_id=rs["id"], output_index=rs["index"],
+                                 summary_index=0, delta=rtext)
                     text = delta.get("content")
+                    if (text or delta.get("tool_calls")) and rs is not None and not rs_closed:
+                        for x in close_rs():
+                            yield x
                     if text:
                         if msg is None:
                             msg = {"id": "msg_" + uuid.uuid4().hex[:24], "text": "", "index": len(output)}
@@ -360,6 +408,8 @@ async def _translate_stream(chat_stream: StreamingResponse, rid: str, body: Dict
         yield ev("response.failed", response={**_response_obj(rid, body, output, usage, "failed", created),
                                                 "error": {"code": "server_error", "message": "upstream stream interrupted"}})
         return
+    for x in close_rs():
+        yield x
     for x in close_msg():
         yield x
     for st in calls.values():
